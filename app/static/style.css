@@ -456,3 +456,156 @@ button { font-family: inherit; }
 .action-tag.transfer    { background: #eafaf1; color: #0f8a4c; }
 .action-tag.revoke      { background: #fde8e8; color: #c02f33; }
 .action-tag.grant       { background: #e5f8ee; color: #0f8a4c; }
+
+/* =====================================================================
+   环境管理 / 发布窗口 / 应用健康 新增样式
+   ===================================================================== */
+
+/* 自定义环境标签 */
+.env-tag.custom-env { background: #f3e8ff; color: #7c3aed; }
+.custom-tag {
+  display: inline-block; font-size: 11px; font-weight: 500; line-height: 1;
+  padding: 3px 7px; border-radius: 5px; background: #f3e8ff; color: #7c3aed;
+  vertical-align: middle; margin-left: 6px;
+}
+.custom-tag.big { font-size: 12px; padding: 4px 9px; }
+
+/* 健康分级色 */
+.lv-ok     { background: #e5f8ee; color: #0f8a4c; }
+.lv-warn   { background: #fdf3d7; color: #ad7209; }
+.lv-danger { background: #fde8e8; color: #c02f33; }
+.health-dot {
+  margin-left: auto; width: 9px; height: 9px; border-radius: 50%;
+  background: var(--grey); flex: none;
+}
+.health-dot.lv-ok { background: var(--green); }
+.health-dot.lv-ok::after { content: ""; }
+.health-dot.lv-warn { background: var(--amber); }
+.health-dot.lv-danger { background: var(--red); }
+.red { color: var(--red) !important; }
+.amber { color: var(--amber) !important; }
+
+/* 作战台告警面板 */
+.alert-panel { border-left: 4px solid var(--red); margin-bottom: 16px; }
+.alert-panel-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
+.alert-panel-head h3 { margin: 0; }
+.alert-count { color: var(--red); font-size: 13px; font-weight: 600; }
+.alert-list { display: flex; flex-direction: column; gap: 8px; }
+.alert-row {
+  display: flex; align-items: center; gap: 12px; padding: 10px 12px;
+  border: 1px solid var(--line); border-radius: 8px; cursor: pointer;
+  background: #fff;
+}
+.alert-row.offline { border-color: #f3b4b6; background: #fef7f7; }
+.alert-row.crash { border-color: #f5d9a8; background: #fffbf3; }
+.alert-row:hover { box-shadow: var(--shadow); }
+.alert-badge {
+  font-size: 12px; font-weight: 600; padding: 4px 10px; border-radius: 6px;
+  white-space: nowrap; flex: none;
+}
+.alert-node { font-size: 13px; min-width: 130px; }
+.alert-where { display: flex; flex-direction: column; line-height: 1.35; }
+.alert-bl { color: var(--ink-3); font-size: 12px; }
+.alert-time { margin-left: auto; font-size: 13px; white-space: nowrap; }
+.alert-go { color: var(--brand); font-size: 13px; white-space: nowrap; }
+.ok-banner { color: #0f8a4c; text-align: center; margin-bottom: 16px; border-left: 4px solid var(--green); }
+
+/* 应用详情环境卡片 */
+.env-section-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; gap: 10px; flex-wrap: wrap; }
+.app-env-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(218px, 1fr)); gap: 12px; }
+.app-env-card {
+  border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px;
+  cursor: pointer; transition: box-shadow .15s, border-color .15s;
+  background: #fff;
+}
+.app-env-card:hover { border-color: var(--brand); box-shadow: var(--shadow); }
+.aec-head { display: flex; align-items: center; gap: 6px; font-size: 15px; margin-bottom: 8px; }
+.aec-inst { display: flex; gap: 10px; flex-wrap: wrap; font-size: 12px; color: var(--ink-2); margin-bottom: 4px; }
+.aec-cfg { color: var(--ink-3); font-size: 12px; }
+.aec-window { font-size: 12px; margin-top: 6px; }
+.aec-window.open { color: var(--green); }
+.aec-window.closed { color: var(--red); }
+.aec-next { color: var(--ink-3); font-size: 11px; margin-top: 2px; }
+.aec-crash { color: var(--red); font-weight: 600; }
+.aec-freq { color: var(--amber); font-weight: 600; }
+.aec-normal { color: var(--ink-3); }
+.aec-none { color: var(--ink-3); }
+.aec-actions { display: flex; gap: 10px; margin-top: 8px; padding-top: 8px; border-top: 1px dashed var(--line); }
+.aec-link { font-size: 12px; }
+
+/* 环境详情页布局 */
+.env-grid { align-items: start; }
+.win-status { border-radius: 8px; padding: 12px 14px; margin-bottom: 12px; }
+.win-status.open { background: #edf9f2; border: 1px solid #b6e6cb; }
+.win-status.closed { background: #fdeeee; border: 1px solid #f3b4b6; }
+.ws-title { font-weight: 700; margin-bottom: 4px; }
+.win-status.closed .ws-title { color: #c02f33; }
+.win-status.open .ws-title { color: #0f8a4c; }
+.ws-msg { font-size: 13px; color: var(--ink-2); }
+.deploy-bar { display: flex; gap: 8px; margin-bottom: 14px; }
+.deploy-bar input { flex: 1; }
+
+/* 窗口编辑器 */
+.win-editor { border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
+.win-editor-tip { color: var(--ink-3); font-size: 12px; margin-bottom: 10px; }
+.win-day { display: grid; grid-template-columns: 48px 1fr auto; gap: 10px; align-items: center; padding: 6px 0; border-bottom: 1px dashed var(--line); }
+.win-day:last-child { border-bottom: 0; }
+.win-dayname { font-size: 13px; color: var(--ink-2); }
+.win-segs { display: flex; flex-direction: column; gap: 6px; }
+.win-seg { display: flex; align-items: center; gap: 6px; }
+.win-seg input[type="time"] { width: 110px; padding: 4px 6px; }
+.win-seg span { color: var(--ink-3); }
+
+/* 实例健康 */
+.health-summary { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin: 10px 0 12px; }
+.hs-item { background: #f6f8fb; border-radius: 8px; padding: 10px; text-align: center; }
+.hs-num { font-size: 22px; font-weight: 700; }
+.hs-num.ok { color: var(--green); }
+.hs-num.red { color: var(--red); }
+.hs-num.amber { color: var(--amber); }
+.hs-lbl { color: var(--ink-3); font-size: 12px; }
+.health-banner { border-radius: 8px; padding: 9px 12px; font-size: 13px; margin-bottom: 10px; }
+.health-banner.danger { background: #fdeeee; border: 1px solid #f3b4b6; color: #c02f33; }
+.health-banner.warn { background: #fdf6e7; border: 1px solid #f0d59a; color: #8a5a00; }
+.inst-table .st.running { color: var(--green); font-size: 12px; white-space: nowrap; }
+.inst-table .st.stopped { color: var(--red); font-size: 12px; white-space: nowrap; }
+.level-tag { font-size: 12px; padding: 2px 9px; border-radius: 5px; white-space: nowrap; }
+.inst-row.level-offline td { background: #fef7f7; }
+.inst-row.level-crash_loop td { background: #fff8ec; }
+
+/* 事件流 */
+.event-list { display: flex; flex-direction: column; gap: 8px; }
+.event-item {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; font-size: 13px;
+}
+.ev-tag { font-size: 12px; padding: 2px 8px; border-radius: 5px; background: #eef1f6; color: var(--ink-2); }
+.ev-tag.restart { background: #fdf3d7; color: #ad7209; }
+.ev-tag.offline { background: #fde8e8; color: #c02f33; }
+.ev-tag.recover { background: #e5f8ee; color: #0f8a4c; }
+.ev-tag.register { background: #e8f0ff; color: #2f6bff; }
+.ev-meta { color: var(--ink-3); font-size: 12px; margin-left: auto; }
+.ev-note { width: 100%; color: var(--ink-2); font-size: 12px; }
+
+/* 发布拦截 / 删除拦截 */
+.blocked-box {
+  background: #fdeeee; border: 1px solid #f3b4b6; border-radius: 8px;
+  padding: 12px 14px; margin: 10px 0;
+}
+.blocked-msg { color: #8f2126; font-size: 13px; line-height: 1.7; }
+.blocker-item { color: #8f2126; font-size: 13px; line-height: 1.8; }
+
+/* 运维留痕动作色 */
+.action-tag.ops-deploy_ok { background: #e5f8ee; color: #0f8a4c; }
+.action-tag.ops-deploy_blocked { background: #fde8e8; color: #c02f33; }
+.action-tag.ops-env_create, .action-tag.ops-env_delete { background: #e8f0ff; color: #2f6bff; }
+.action-tag.ops-window_update, .action-tag.ops-block_add, .action-tag.ops-block_remove {
+  background: #f3e8ff; color: #7c3aed;
+}
+.action-tag.ops-offline { background: #fde8e8; color: #c02f33; }
+.action-tag.ops-restart { background: #fdf3d7; color: #ad7209; }
+.action-tag.ops-recover, .action-tag.ops-register { background: #e5f8ee; color: #0f8a4c; }
+.ops-row.act-deploy_blocked td { background: #fef7f7; }
+.ops-row.act-offline td { background: #fef7f7; }
+.app-env-card.env-locked { opacity: .72; background: #fafbfd; cursor: not-allowed; }
+.app-env-card.env-locked:hover { border-color: var(--line); box-shadow: none; }

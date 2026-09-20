@@ -11,6 +11,9 @@ const state = {
   filters: { business_line_id: "", owner_id: "", environment: "", status: "", q: "" },
   configFilters: { app_id: "", environment: "" },
   auditFilters: { app_id: "", business_line_id: "", environment: "", action: "", start: "", end: "" },
+  opsFilters: { app_id: "", business_line_id: "", env_key: "", category: "", start: "", end: "" },
+  auditTab: "config",   // config=配置逐键流水 | ops=环境/窗口/健康留痕
+  appEnvCache: {},      // appId -> 该应用自身环境（含自定义环境标签）
 };
 
 /* ---------------- 工具 ---------------- */
@@ -77,7 +80,7 @@ function statusBadge(app) {
 }
 
 function envTag(app) {
-  return `<span class="env-tag ${esc(app.environment)}">${esc(app.environment_label)}</span>`;
+  return `<span class="env-tag ${envTagClass(app.environment)}">${esc(app.environment_label)}</span>`;
 }
 
 function redDotsHtml(app) {
@@ -173,6 +176,7 @@ function route() {
   $$("#topnav a").forEach((a) => a.classList.toggle("active", a.dataset.route === parts[0]));
   if (parts[0] === "apps" && parts[1]) renderAppDetail(parts[1]);
   else if (parts[0] === "apps") renderApps();
+  else if (parts[0] === "env" && parts[1] && parts[2]) renderEnvDetail(parts[1], parts[2]);
   else if (parts[0] === "config") {
     if (parts[1]) renderConfigProfile(parts[1], parts[2] || "");
     else renderConfigList();
@@ -208,9 +212,24 @@ async function renderConsole() {
     <div class="stats-grid">
       <div class="panel stat-card"><div class="num">${t.apps}</div><div class="label">应用总数</div></div>
       <div class="panel stat-card"><div class="num">${t.business_lines}</div><div class="label">业务线</div></div>
+      <div class="panel stat-card"><div class="num ${t.offline_instances ? "red" : ""}">${t.offline_instances}</div><div class="label">掉线实例</div></div>
+      <div class="panel stat-card"><div class="num ${t.crash_loop_instances ? "red" : ""}">${t.crash_loop_instances}</div><div class="label">反复重启实例</div></div>
       <div class="panel stat-card"><div class="num">${t.recent_changed}</div><div class="label">近 7 天有变更</div></div>
       <div class="panel stat-card"><div class="num ${t.red_dot_apps ? "red" : ""}">${t.red_dot_apps}</div><div class="label">红点待处理应用</div></div>
     </div>
+
+    ${(data.health_alerts || []).length ? `
+    <div class="panel panel-pad alert-panel">
+      <div class="alert-panel-head">
+        <h3>🩺 实例健康告警（掉线 / 反复重启）</h3>
+        <span class="alert-count">${data.health_alerts.length} 个实例需要处理</span>
+      </div>
+      <div class="alert-list">
+        ${data.health_alerts.map((a) => healthAlertHtml(a)).join("")}
+      </div>
+    </div>` : `
+    <div class="panel panel-pad ok-banner">✅ 当前可见范围内所有实例运行正常，没有掉线或反复重启的实例</div>
+    `}
 
     <div class="dash-grid">
       <div class="panel panel-pad">
@@ -270,6 +289,32 @@ async function renderConsole() {
   $$("[data-app-id]", view).forEach((el) => {
     el.onclick = () => { location.hash = `#/apps/${el.dataset.appId}`; };
   });
+  $$("[data-alert-app]", view).forEach((el) => {
+    el.onclick = () => { location.hash = `#/env/${el.dataset.alertApp}/${el.dataset.alertEnv}`; };
+  });
+}
+
+/* ---------------- 健康告警通用渲染 ---------------- */
+function healthLevelClass(level) {
+  return { healthy: "lv-ok", frequent: "lv-warn", crash_loop: "lv-danger", offline: "lv-danger" }[level] || "lv-ok";
+}
+
+function healthAlertHtml(a) {
+  const isOffline = a.level === "offline";
+  const timeText = isOffline
+    ? (a.offline_since ? `掉线于 ${fmtTime(a.offline_since)}（${fmtAgo(a.offline_since)}）` : "已掉线")
+    : `近 24 小时重启 <b>${a.restarts_24h}</b> 次${a.last_restart_at ? `，最后 ${fmtAgo(a.last_restart_at)}` : ""}`;
+  return `
+    <div class="alert-row ${isOffline ? "offline" : "crash"}" data-alert-app="${a.app_id}" data-alert-env="${esc(a.env_key)}">
+      <span class="alert-badge ${healthLevelClass(a.level)}">${isOffline ? "● 掉线" : "↻ 反复重启"}</span>
+      <span class="alert-node mono">${esc(a.node_name)}</span>
+      <span class="alert-where">
+        <b>${esc(a.app_name)}</b>
+        <span class="alert-bl">${esc(a.business_line_name)} · ${esc(a.environment_label)}</span>
+      </span>
+      <span class="alert-time ${isOffline ? "red" : "amber"}">${timeText}</span>
+      <span class="alert-go">处理 →</span>
+    </div>`;
 }
 
 /* ---------------- 应用台账 ---------------- */
@@ -450,6 +495,17 @@ async function renderAppDetail(appId) {
       <span style="margin-right:10px;color:var(--ink-2)">风险提示：</span>${redDotsHtml(app)}
     </div>` : ""}
 
+    <div class="panel panel-pad" style="margin-bottom:16px">
+      <div class="env-section-head">
+        <h3 style="margin:0">环境与健康</h3>
+        <div>
+          <span style="color:var(--ink-3);font-size:12px;margin-right:10px">环境可自定义（开发/预发/生产不写死）；每个环境独立设发布窗口与实例健康</span>
+          ${canManage && !isOffline ? '<button class="btn small primary" id="btn-new-env">+ 新增环境</button>' : ""}
+        </div>
+      </div>
+      <div id="app-env-list"><div class="empty-tip">环境信息加载中…</div></div>
+    </div>
+
     <div class="detail-grid">
       <div>
         <div class="panel panel-pad" style="margin-bottom:16px">
@@ -528,6 +584,116 @@ async function renderAppDetail(appId) {
     btn.onclick = () => transitionStatus(app.id, btn.dataset.toStatus);
   });
   renderEnvEditor(app);
+  renderAppEnvPanel(app);
+}
+
+/* ---------------- 应用详情：环境与健康卡片 ---------------- */
+async function renderAppEnvPanel(app) {
+  const box = $("#app-env-list");
+  if (!box) return;
+  let data;
+  try {
+    data = await api(`/api/apps/${app.id}/environments`);
+  } catch (e) {
+    box.innerHTML = `<div class="empty-tip">环境信息加载失败：${esc(e.message)}</div>`;
+    return;
+  }
+  if (!data.environments.length) {
+    box.innerHTML = `<div class="empty-tip">该应用还没有环境</div>`;
+    return;
+  }
+  box.innerHTML = `
+    <div class="app-env-grid">
+      ${data.environments.map((e) => {
+        if (e.visible === false) {
+          return `
+          <div class="app-env-card env-locked" title="该环境不在你的可见范围内，窗口与实例信息不可见">
+            <div class="aec-head"><b>${esc(e.label)}</b>
+              ${e.is_builtin ? "" : '<span class="custom-tag">自定义</span>'}
+              <span class="health-dot"></span></div>
+            <div class="aec-cfg">🔒 无该环境访问权</div>
+            <div class="aec-window" style="color:var(--ink-3)">窗口 / 健康信息不可见</div>
+          </div>`;
+        }
+        const healthCls = e.instance_stopped ? "lv-danger"
+          : e.crash_loop_count ? "lv-danger"
+          : e.frequent_count ? "lv-warn" : "lv-ok";
+        return `
+        <div class="app-env-card" data-env-key="${esc(e.env_key)}">
+          <div class="aec-head">
+            <b>${esc(e.label)}</b>
+            ${e.is_builtin ? "" : '<span class="custom-tag">自定义</span>'}
+            <span class="health-dot ${healthCls}"></span>
+          </div>
+          <div class="aec-inst">
+            ${e.instance_total === 0 ? '<span class="aec-none">无实例</span>'
+              : `<span class="${e.instance_stopped ? "red" : ""}"><b>${e.instance_alive}</b>/${e.instance_total} 存活</span>`}
+            ${e.crash_loop_count ? '<span class="aec-crash">反复重启 ×' + e.crash_loop_count + "</span>"
+              : e.frequent_count ? '<span class="aec-freq">重启偏多 ×' + e.frequent_count + "</span>"
+              : e.restarts_24h ? `<span class="aec-normal">近24h重启 ${e.restarts_24h}</span>` : ""}
+          </div>
+          <div class="aec-cfg">配置 ${e.config_count} 项 · v${e.latest_version}</div>
+          <div class="aec-window ${e.window_open ? "open" : "closed"}">
+            ${e.window_open ? "🟢 窗口开放中" : "🔴 窗口关闭"}
+          </div>
+          ${!e.window_open && e.next_open_text ? `<div class="aec-next">下次：${esc(e.next_open_text)}</div>` : ""}
+          <div class="aec-actions">
+            <a class="aec-link" href="#/env/${app.id}/${encodeURIComponent(e.env_key)}">环境与健康 →</a>
+            <a class="aec-link" href="#/config/${app.id}/${encodeURIComponent(e.env_key)}">配置档案 →</a>
+          </div>
+        </div>`;
+      }).join("")}
+    </div>`;
+  $$(".app-env-card .aec-link", box).forEach((a) => { a.onclick = (ev) => ev.stopPropagation(); });
+  $$(".app-env-card", box).forEach((card) => {
+    card.onclick = () => {
+      if (card.classList.contains("env-locked")) {
+        toast("该环境不在你的可见范围内，窗口与实例信息不可见", "error");
+        return;
+      }
+      location.hash = `#/env/${app.id}/${encodeURIComponent(card.dataset.envKey)}`;
+    };
+  });
+  const newBtn = $("#btn-new-env");
+  if (newBtn) newBtn.onclick = () => openCreateEnvModal(app);
+}
+
+function openCreateEnvModal(app) {
+  const root = $("#modal-root");
+  root.innerHTML = `
+    <div class="modal-mask">
+      <div class="modal" style="width:440px">
+        <h3>为「${esc(app.name)}」新增环境</h3>
+        <p style="color:var(--ink-2);font-size:13px">
+          开发、预发、生产等环境不再写死，业务线可按需要自建（如灰度、压测、预上线）。
+          新环境创建后可独立配置发布窗口、登记实例、管理配置档案。
+        </p>
+        <div class="form-grid" style="grid-template-columns:1fr">
+          <div><label>环境名称 *</label>
+            <input id="ev-name" maxlength="16" placeholder="如：灰度 / 压测 / 预上线"></div>
+        </div>
+        <div class="form-error" id="ev-error"></div>
+        <div class="form-actions">
+          <button class="btn" id="ev-cancel">取消</button>
+          <button class="btn primary" id="ev-submit">创建环境</button>
+        </div>
+      </div>
+    </div>`;
+  const close = () => { root.innerHTML = ""; };
+  $("#ev-cancel").onclick = close;
+  $(".modal-mask", root).onclick = (e2) => { if (e2.target.classList.contains("modal-mask")) close(); };
+  $("#ev-submit").onclick = async () => {
+    const box = $("#ev-error");
+    box.classList.remove("show");
+    const label = $("#ev-name").value.trim();
+    if (!label) { box.textContent = "环境名称不能为空"; box.classList.add("show"); return; }
+    try {
+      const r = await api(`/api/apps/${app.id}/environments`, { method: "POST", body: { label } });
+      close();
+      toast(`环境「${r.environment.label}」已创建`, "success");
+      renderAppDetail(app.id);
+    } catch (e) { box.textContent = e.message; box.classList.add("show"); }
+  };
 }
 
 function renderEnvEditor(app) {
@@ -632,9 +798,12 @@ function openAppModal(app) {
           </div>
           <div>
             <label>环境 *</label>
-            <select id="m-env">
-              ${state.meta.environments.map((e) => `<option value="${e.value}" ${isEdit && app.environment === e.value ? "selected" : ""}>${esc(e.label)}</option>`).join("")}
+            <select id="m-env" data-app-id="${isEdit ? app.id : ""}">
+              ${isEdit
+                ? `<option value="${esc(app.environment)}">${esc(app.environment_label)}</option>`
+                : state.meta.environments.map((e) => `<option value="${e.value}">${esc(e.label)}</option>`).join("")}
             </select>
+            ${isEdit ? '<div class="field-hint">可选范围为该应用自身的环境；新增/删除环境请在详情页「环境与健康」中操作</div>' : ""}
           </div>
           <div class="full">
             <label>描述</label>
@@ -656,6 +825,16 @@ function openAppModal(app) {
   const blSel = $("#m-bl");
   if (!isEdit) {
     blSel.onchange = () => { $("#m-owner").innerHTML = `<option value="">（暂不指定）</option>` + ownerOptions(blSel.value); };
+  }
+  if (isEdit) {
+    // 应用所属环境只能切到该应用自身存在的环境（含自定义环境）
+    api(`/api/apps/${app.id}/environments`).then((d) => {
+      const sel = $("#m-env");
+      if (!sel) return;
+      sel.innerHTML = d.environments.map((e) =>
+        `<option value="${esc(e.env_key)}" ${e.env_key === app.environment ? "selected" : ""}>${esc(e.label)}</option>`
+      ).join("");
+    }).catch(() => {});
   }
 
   $("#m-submit").onclick = async () => {
@@ -703,7 +882,475 @@ function openAppModal(app) {
   };
 }
 
-/* ---------------- 配置档案 · 列表 ---------------- */
+/* ---------------- 环境详情：发布窗口 + 实例健康 ---------------- */
+async function renderEnvDetail(appId, envKey) {
+  const view = $("#view");
+  view.innerHTML = `<div class="empty-tip">加载中…</div>`;
+  let d;
+  try {
+    d = await api(`/api/apps/${appId}/environments/${encodeURIComponent(envKey)}`);
+  } catch (e) {
+    view.innerHTML = errorStateHtml(e.status === 403 ? "403 无权访问" : e.status === 404 ? "404 环境不存在" : "加载失败", e.message);
+    return;
+  }
+  const env = d.environment;
+  const canManage = !!d.can_manage && !d.read_only;
+  const h = d.health;
+  const win = d.window;
+  view.innerHTML = `
+    <div class="page-head">
+      <div>
+        <h2>${esc(d.app_name)} · ${esc(env.label)}环境
+          ${env.is_builtin ? "" : '<span class="custom-tag big">自定义环境</span>'}</h2>
+        <div class="sub">发布窗口管控 · 节假日封网 · 实例健康与重启监测</div>
+      </div>
+      <div style="display:flex;gap:8px">
+        <button class="btn" id="ed-back-app">查看应用</button>
+        <button class="btn" id="ed-config">配置档案</button>
+        ${d.can_manage && !d.read_only ? '<button class="btn" id="ed-rename">环境改名</button>' : ""}
+        ${d.can_manage && !d.read_only ? '<button class="btn danger" id="ed-delete">删除环境</button>' : ""}
+      </div>
+    </div>
+
+    ${d.read_only ? '<div class="panel panel-pad perm-notice">应用已下线（终态），窗口设置、实例与发布均只读。</div>'
+      : (!d.can_manage ? '<div class="panel panel-pad perm-notice">你当前以只读方式查看该环境，窗口设置与实例操作需要应用/业务线管理权限。</div>' : "")}
+
+    <div class="detail-grid env-grid">
+      <div>
+        <!-- 发布与窗口 -->
+        <div class="panel panel-pad" style="margin-bottom:16px">
+          <h3>发布窗口</h3>
+          <div class="win-status ${win.open ? "open" : "closed"}">
+            <div class="ws-title">${win.open ? "🟢 当前允许发布" : "🔴 当前禁止发布"}</div>
+            <div class="ws-msg">${esc(win.message)}</div>
+          </div>
+          <div class="deploy-bar">
+            <input id="ed-deploy-note" maxlength="200" placeholder="本次发布说明（可选）" ${canManage ? "" : "disabled"}>
+            <button class="btn ${win.open ? "primary" : "danger"}" id="ed-deploy" ${canManage ? "" : "disabled"}
+              title="${canManage ? "窗口外点击也会尝试发布，系统会明确拦截并告知下一次窗口" : "无发布权限"}">
+              立即发布上线
+            </button>
+          </div>
+          ${canManage ? `<div id="win-editor-wrap"></div>` : ""}
+        </div>
+
+        <!-- 节假日封网 -->
+        <div class="panel panel-pad">
+          <h3>节假日 / 特殊日期封网</h3>
+          <div id="block-list"></div>
+          ${canManage ? `
+          <div class="filter-bar" style="box-shadow:none;border:0;padding:8px 0 0">
+            <input type="date" id="blk-date" title="封网日期">
+            <input id="blk-reason" class="grow" maxlength="100" placeholder="封网原因（必填，如：国庆假期 / 大促封网）">
+            <button class="btn primary small" id="blk-add">新增封网日</button>
+          </div>` : ""}
+        </div>
+      </div>
+
+      <div>
+        <!-- 实例健康 -->
+        <div class="panel panel-pad" style="margin-bottom:16px">
+          <div class="cfg-toolbar">
+            <h3 style="margin:0">实例健康</h3>
+            ${canManage ? '<button class="btn small primary" id="inst-add">+ 登记实例</button>' : ""}
+          </div>
+          <div class="health-summary">
+            <div class="hs-item"><div class="hs-num">${h.total}</div><div class="hs-lbl">实例总数</div></div>
+            <div class="hs-item"><div class="hs-num ok">${h.alive}</div><div class="hs-lbl">运行中</div></div>
+            <div class="hs-item"><div class="hs-num ${h.stopped ? "red" : ""}">${h.stopped}</div><div class="hs-lbl">已掉线</div></div>
+            <div class="hs-item"><div class="hs-num ${h.crash_loop_count ? "red" : h.frequent_count ? "amber" : ""}">${h.restarts_24h}</div><div class="hs-lbl">近24h重启</div></div>
+          </div>
+          ${h.crash_loop_count ? '<div class="health-banner danger">⚠️ 有实例在 24 小时内反复重启（≥5 次），疑似异常，与正常重启分级处理</div>' : ""}
+          ${!h.crash_loop_count && h.frequent_count ? '<div class="health-banner warn">有实例近 24 小时重启 3~4 次，请关注（区别于一天重启二十次的反复重启故障）</div>' : ""}
+          <div id="inst-table-wrap"></div>
+        </div>
+
+        <!-- 最近事件 -->
+        <div class="panel panel-pad">
+          <h3>实例事件（最近 15 条）</h3>
+          <div class="event-list">
+            ${d.recent_events.length ? d.recent_events.map((ev) => `
+              <div class="event-item ${esc(ev.event_type)}">
+                <span class="ev-tag ${esc(ev.event_type)}">${esc(ev.event_label)}</span>
+                <span class="mono">${esc(ev.node_name)}</span>
+                <span class="ev-meta">${esc(ev.actor_name)} · ${fmtAgo(ev.created_at)}</span>
+                ${ev.note ? `<div class="ev-note">${esc(ev.note)}</div>` : ""}
+              </div>`).join("") : '<div class="empty-tip">暂无事件</div>'}
+          </div>
+          <a class="btn small" style="margin-top:10px" id="ed-to-audit">到变更留痕查看完整流水 →</a>
+        </div>
+      </div>
+    </div>`;
+
+  $("#ed-back-app").onclick = () => { location.hash = `#/apps/${appId}`; };
+  $("#ed-config").onclick = () => { location.hash = `#/config/${appId}/${encodeURIComponent(envKey)}`; };
+  const renameBtn = $("#ed-rename");
+  if (renameBtn) renameBtn.onclick = () => openRenameEnvModal(d, () => renderEnvDetail(appId, envKey));
+  const delBtn = $("#ed-delete");
+  if (delBtn) delBtn.onclick = () => openDeleteEnvModal(d);
+  $("#ed-deploy").onclick = () => doDeploy(d, $("#ed-deploy-note").value.trim());
+  if (canManage) paintWindowEditor(d);
+  paintBlockList(d);
+  $("#ed-to-audit").onclick = () => {
+    state.auditTab = "ops";
+    state.opsFilters = {
+      app_id: String(d.app_id), business_line_id: "", env_key: d.environment.env_key,
+      category: "", start: "", end: "",
+    };
+    location.hash = "#/audit";
+  };
+  if (canManage) {
+    $("#blk-add").onclick = () => addBlockDay(d);
+    $("#inst-add").onclick = () => openAddInstanceModal(d);
+  }
+  paintInstanceTable(d, canManage);
+}
+
+async function reloadEnvDetail(d) {
+  await renderEnvDetail(d.app_id, d.environment.env_key);
+}
+
+/* ---------- 发布：窗口外服务端拦截并告知下一次窗口 ---------- */
+async function doDeploy(d, note) {
+  try {
+    const r = await api(`/api/apps/${d.app_id}/environments/${encodeURIComponent(d.environment.env_key)}/deploy`,
+      { method: "POST", body: { note } });
+    toast(r.message || "发布成功", "success");
+    reloadEnvDetail(d);
+  } catch (e) {
+    if (e.status === 409 && e.payload && e.payload.code === "deploy_window_closed") {
+      openDeployBlockedModal(e.payload, d);
+    } else {
+      toast(e.message, "error");
+    }
+  }
+}
+
+function openDeployBlockedModal(p, d) {
+  const root = $("#modal-root");
+  root.innerHTML = `
+    <div class="modal-mask">
+      <div class="modal" style="width:520px">
+        <h3>🚫 不在发布窗口，本次上线已被拦截</h3>
+        <div class="blocked-box">
+          <div class="blocked-msg">${esc(p.message || "")}</div>
+        </div>
+        <p style="color:var(--ink-2);font-size:13px">
+          系统不会放行窗口外的上线。如确属紧急故障，请先走封网/紧急发布审批，
+          由有权限人员调整该环境的发布窗口或解除对应封网日后，再回到本页发布。
+        </p>
+        <div class="form-actions">
+          <button class="btn" id="db-close">我知道了</button>
+          <button class="btn primary" id="db-goto">查看窗口设置</button>
+        </div>
+      </div>
+    </div>`;
+  $("#db-close").onclick = () => { root.innerHTML = ""; };
+  $("#db-goto").onclick = () => { root.innerHTML = ""; };
+  $(".modal-mask", root).onclick = (e) => { if (e.target.classList.contains("modal-mask")) root.innerHTML = ""; };
+}
+
+/* ---------- 环境改名 / 删除 ---------- */
+function openRenameEnvModal(d, onDone) {
+  const root = $("#modal-root");
+  root.innerHTML = `
+    <div class="modal-mask"><div class="modal" style="width:420px">
+      <h3>环境改名</h3>
+      <p style="color:var(--ink-3);font-size:12px">只改显示名，环境标识（${esc(d.environment.env_key)}）不变，配置、实例与历史留痕不受影响；改名会进留痕。</p>
+      <input id="rn-label" maxlength="16" value="${esc(d.environment.label)}">
+      <div class="form-error" id="rn-error"></div>
+      <div class="form-actions">
+        <button class="btn" id="rn-cancel">取消</button>
+        <button class="btn primary" id="rn-submit">保存</button>
+      </div>
+    </div></div>`;
+  const close = () => { root.innerHTML = ""; };
+  $("#rn-cancel").onclick = close;
+  $("#rn-submit").onclick = async () => {
+    const box = $("#rn-error");
+    box.classList.remove("show");
+    try {
+      await api(`/api/apps/${d.app_id}/environments/${encodeURIComponent(d.environment.env_key)}`,
+        { method: "PATCH", body: { label: $("#rn-label").value.trim() } });
+      close(); toast("环境已改名并留痕", "success"); onDone();
+    } catch (e) { box.textContent = e.message; box.classList.add("show"); }
+  };
+}
+
+function openDeleteEnvModal(d) {
+  const root = $("#modal-root");
+  root.innerHTML = `
+    <div class="modal-mask"><div class="modal" style="width:520px">
+      <h3>删除环境「${esc(d.environment.label)}」</h3>
+      <div id="del-body"><div class="empty-tip">正在清点挂在该环境上的资源…</div></div>
+      <div class="form-actions">
+        <button class="btn" id="del-cancel">取消</button>
+      </div>
+    </div></div>`;
+  const close = () => { root.innerHTML = ""; };
+  $("#del-cancel").onclick = close;
+  const body = $("#del-body");
+  if (d.delete_blockers && d.delete_blockers.length) {
+    body.innerHTML = `
+      <div class="blocked-box">
+        <div style="color:var(--red);font-weight:600;margin-bottom:8px">该环境不能删除，仍有资源挂在它上面：</div>
+        ${d.delete_blockers.map((b) => `<div class="blocker-item">· ${esc(b)}</div>`).join("")}
+        <div style="color:var(--ink-3);font-size:12px;margin-top:8px">请先清空/迁移配置、摘除实例后再删除（系统不会连带删除业务资产）。</div>
+      </div>`;
+    return;
+  }
+  body.innerHTML = `
+    <p style="color:var(--ink-2);font-size:13px">
+      该环境下没有配置项与实例，可以删除。环境自身的发布窗口与封网日会随环境一并清除。
+      删除操作会进入变更留痕。
+    </p>
+    <div class="form-error" id="del-error"></div>
+    <div class="form-actions">
+      <button class="btn danger" id="del-confirm">确认删除</button>
+    </div>`;
+  $("#del-confirm").onclick = async () => {
+    try {
+      await api(`/api/apps/${d.app_id}/environments/${encodeURIComponent(d.environment.env_key)}`,
+        { method: "DELETE" });
+      close();
+      toast("环境已删除并留痕", "success");
+      location.hash = `#/apps/${d.app_id}`;
+    } catch (e) {
+      if (e.status === 409 && e.payload && e.payload.blockers) {
+        body.innerHTML = `
+          <div class="blocked-box">
+            <div style="color:var(--red);font-weight:600;margin-bottom:8px">该环境不能删除，仍有资源挂在它上面：</div>
+            ${e.payload.blockers.map((b) => `<div class="blocker-item">· ${esc(b.detail)}</div>`).join("")}
+          </div><div class="form-actions"><button class="btn" onclick="document.getElementById('modal-root').innerHTML=''">关闭</button></div>`;
+      } else {
+        const box = $("#del-error");
+        box.textContent = e.message; box.classList.add("show");
+      }
+    }
+  };
+}
+
+/* ---------- 发布窗口编辑器 ---------- */
+function paintWindowEditor(d) {
+  const wrap = $("#win-editor-wrap");
+  const days = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"];
+  // rulesState[weekday] = [[start,end],...]
+  const rulesState = days.map(() => []);
+  d.rules.forEach((r) => { rulesState[r.weekday].push([r.start_time, r.end_time]); });
+  wrap.innerHTML = `
+    <div class="win-editor">
+      <div class="win-editor-tip">
+        勾选星期并填写允许发布的时段（可多段）；没有任何时段的日期全天禁发。
+        清空全部规则 = 不再按星期/时段限制（节假日封网仍生效）。改动保存后立即生效并留痕。
+      </div>
+      ${days.map((name, wd) => `
+        <div class="win-day" data-wd="${wd}">
+          <div class="win-dayname">${name}</div>
+          <div class="win-segs"></div>
+          <button class="btn small win-add">+ 时段</button>
+        </div>`).join("")}
+    </div>
+    <div style="display:flex;gap:8px;margin-top:10px">
+      <button class="btn primary small" id="win-save">保存发布窗口</button>
+      <button class="btn small" id="win-clear">清空周计划（不限制时段）</button>
+    </div>
+    <div class="form-error" id="win-error"></div>`;
+
+  const collect = () => {
+    const rules = [];
+    $$(".win-day", wrap).forEach((day) => {
+      const wd = +day.dataset.wd;
+      $$(".win-seg", day).forEach((seg) => {
+        const st = $(".ws-start", seg).value, et = $(".ws-end", seg).value;
+        if (st || et) rules.push({ weekday: wd, start_time: st || "00:00", end_time: et || "23:59" });
+      });
+    });
+    return rules;
+  };
+  const paintDay = (day) => {
+    const wd = +day.dataset.wd;
+    const box = $(".win-segs", day);
+    if (!rulesState[wd].length) rulesState[wd].push(["", ""]);
+    box.innerHTML = rulesState[wd].map((seg, i) => `
+      <div class="win-seg">
+        <input type="time" class="ws-start" value="${esc(seg[0])}">
+        <span>~</span>
+        <input type="time" class="ws-end" value="${esc(seg[1])}">
+        <button class="btn small danger" data-i="${i}">删</button>
+      </div>`).join("");
+    $$(".win-seg .btn", box).forEach((b) => {
+      b.onclick = () => { rulesState[wd].splice(+b.dataset.i, 1); paintDay(day); };
+    });
+    $$("input", box).forEach((inp) => {
+      inp.onchange = () => {
+        rulesState[wd] = $$(".win-seg", day).map((seg) => [$(".ws-start", seg).value, $(".ws-end", seg).value]);
+      };
+    });
+  };
+  $$(".win-day", wrap).forEach(paintDay);
+  $$(".win-add", wrap).forEach((b) => {
+    b.onclick = () => { const day = b.closest(".win-day"); rulesState[+day.dataset.wd].push(["10:00", "18:00"]); paintDay(day); };
+  });
+  const save = async (rules) => {
+    const box = $("#win-error");
+    box.classList.remove("show");
+    try {
+      await api(`/api/apps/${d.app_id}/environments/${encodeURIComponent(d.environment.env_key)}/window`,
+        { method: "PUT", body: { rules } });
+      toast("发布窗口已保存并留痕", "success");
+      reloadEnvDetail(d);
+    } catch (e) { box.textContent = e.message; box.classList.add("show"); }
+  };
+  $("#win-save").onclick = () => save(collect());
+  $("#win-clear").onclick = () => {
+    if (confirm("确认清空全部周计划窗口？清空后该环境不再按星期/时段限制发布（节假日封网仍生效）。")) save([]);
+  };
+}
+
+/* ---------- 封网日 ---------- */
+function paintBlockList(d) {
+  const box = $("#block-list");
+  if (!d.blocks.length) {
+    box.innerHTML = `<div class="empty-tip">暂无封网日，按周计划窗口发布</div>`;
+  } else {
+    box.innerHTML = `
+      <table class="env-table">
+        <thead><tr><th>日期</th><th>星期</th><th>封网原因</th><th>设置人</th><th style="width:64px"></th></tr></thead>
+        <tbody>
+          ${d.blocks.map((b) => {
+            const wd = "周" + "日一二三四五六"[new Date(b.block_date + "T00:00:00").getDay()];
+            return `<tr>
+              <td class="nowrap">${esc(b.block_date)}</td><td>${wd}</td>
+              <td>${esc(b.reason)}</td><td>${esc(b.created_by_name)}</td>
+              <td>${d.can_manage && !d.read_only ? `<button class="btn small danger" data-date="${esc(b.block_date)}">解除</button>` : ""}</td>
+            </tr>`;
+          }).join("")}
+        </tbody>
+      </table>`;
+    $$("[data-date]", box).forEach((btn) => {
+      btn.onclick = () => removeBlockDay(d, btn.dataset.date);
+    });
+  }
+}
+
+async function addBlockDay(d) {
+  const date = $("#blk-date").value, reason = $("#blk-reason").value.trim();
+  if (!date) { toast("请选择封网日期", "error"); return; }
+  if (!reason) { toast("封网原因必填（要能在留痕里说清楚为什么封）", "error"); return; }
+  try {
+    await api(`/api/apps/${d.app_id}/environments/${encodeURIComponent(d.environment.env_key)}/blocks`,
+      { method: "POST", body: { block_date: date, reason } });
+    toast("封网日已新增并留痕", "success");
+    reloadEnvDetail(d);
+  } catch (e) { toast(e.message, "error"); }
+}
+
+async function removeBlockDay(d, date) {
+  if (!confirm(`确认解除 ${date} 的封网？解除后该日恢复按周计划窗口发布，操作会留痕。`)) return;
+  try {
+    await api(`/api/apps/${d.app_id}/environments/${encodeURIComponent(d.environment.env_key)}/blocks/${date}`,
+      { method: "DELETE" });
+    toast("封网日已解除并留痕", "success");
+    reloadEnvDetail(d);
+  } catch (e) { toast(e.message, "error"); }
+}
+
+/* ---------- 实例表与操作 ---------- */
+function paintInstanceTable(d, canManage) {
+  const box = $("#inst-table-wrap");
+  const insts = d.health.instances;
+  if (!insts.length) {
+    box.innerHTML = `<div class="empty-tip">该环境还没有登记实例</div>`;
+    return;
+  }
+  box.innerHTML = `
+    <table class="env-table inst-table">
+      <thead><tr>
+        <th>实例</th><th>状态</th><th>健康分级</th><th>累计重启</th><th>近24h</th>
+        <th>最后重启</th><th>掉线时间</th><th style="width:150px">操作</th>
+      </tr></thead>
+      <tbody>
+        ${insts.map((it) => `
+          <tr class="inst-row level-${esc(it.level)}">
+            <td class="mono">${esc(it.node_name)}</td>
+            <td>${it.alive ? '<span class="st running">● 运行中</span>' : '<span class="st stopped">● 已掉线</span>'}</td>
+            <td><span class="level-tag ${healthLevelClass(it.level)}">${esc(it.level_label)}</span></td>
+            <td>${it.restart_count}</td>
+            <td>${it.restarts_24h >= 5 ? `<b class="red">${it.restarts_24h}</b>`
+                : it.restarts_24h >= 3 ? `<b class="amber">${it.restarts_24h}</b>`
+                : it.restarts_24h}</td>
+            <td class="nowrap">${it.last_restart_at ? fmtAgo(it.last_restart_at) : "—"}</td>
+            <td class="nowrap">${it.offline_since ? `<span class="red">${fmtAgo(it.offline_since)}</span>` : "—"}</td>
+            <td>
+              ${canManage ? `
+                ${it.alive ? `<button class="btn small" data-act="restart" data-id="${it.id}">重启</button>`
+                           : `<button class="btn small primary" data-act="recover" data-id="${it.id}">恢复</button>`}
+                ${it.alive ? `<button class="btn small danger" data-act="offline" data-id="${it.id}">摘线</button>` : ""}
+              ` : ""}
+            </td>
+          </tr>`).join("")}
+      </tbody>
+    </table>`;
+  $$("[data-act]", box).forEach((btn) => {
+    btn.onclick = () => instanceAction(d, +btn.dataset.id, btn.dataset.act);
+  });
+}
+
+async function instanceAction(d, instanceId, act) {
+  const labels = { restart: "重启", recover: "恢复上线", offline: "标记掉线/摘线" };
+  const note = prompt(`${labels[act]}：可填写说明（将写入留痕，可留空）`, "");
+  if (note === null) return;
+  try {
+    await api(`/api/apps/${d.app_id}/instances/${instanceId}/${act}`,
+      { method: "POST", body: { note } });
+    toast(`已执行：${labels[act]}（已留痕）`, "success");
+    reloadEnvDetail(d);
+  } catch (e) { toast(e.message, "error"); }
+}
+
+function openAddInstanceModal(d) {
+  const root = $("#modal-root");
+  root.innerHTML = `
+    <div class="modal-mask"><div class="modal" style="width:440px">
+      <h3>登记实例 · ${esc(d.environment.label)}</h3>
+      <p style="color:var(--ink-2);font-size:13px">新登记的实例状态为「运行中」，并写入注册事件。</p>
+      <div class="form-grid" style="grid-template-columns:1fr">
+        <div><label>实例名 / 节点标识 *</label>
+          <input id="ai-node" maxlength="64" placeholder="如 pay-gw-prod-05"></div>
+        <div><label>备注</label><input id="ai-note" maxlength="200"></div>
+      </div>
+      <div class="form-error" id="ai-error"></div>
+      <div class="form-actions">
+        <button class="btn" id="ai-cancel">取消</button>
+        <button class="btn primary" id="ai-submit">登记并上线</button>
+      </div>
+    </div></div>`;
+  const close = () => { root.innerHTML = ""; };
+  $("#ai-cancel").onclick = close;
+  $("#ai-submit").onclick = async () => {
+    const box = $("#ai-error");
+    box.classList.remove("show");
+    try {
+      await api(`/api/apps/${d.app_id}/environments/${encodeURIComponent(d.environment.env_key)}/instances`,
+        { method: "POST", body: { node_name: $("#ai-node").value.trim(), note: $("#ai-note").value.trim() } });
+      close(); toast("实例已登记并上线", "success"); reloadEnvDetail(d);
+    } catch (e) { box.textContent = e.message; box.classList.add("show"); }
+  };
+}
+
+function envLabelOf(key, appId) {
+  const cached = appId != null && state.appEnvCache[appId]
+    ? state.appEnvCache[appId].find((m) => m.environment === key) : null;
+  if (cached) return cached.environment_label || cached.label || key;
+  const builtin = state.meta && state.meta.environments
+    ? state.meta.environments.find((e) => e.value === key) : null;
+  return builtin ? builtin.label : key;
+}
+
+function envTagClass(env) {
+  return ["dev", "test", "staging", "prod"].includes(env) ? env : "custom-env";
+}
+
 function cfgTypeLabel(v) {
   const t = state.configMeta.types.find((x) => x.value === v);
   return t ? t.label : v;
@@ -762,7 +1409,7 @@ async function renderConfigList() {
                   <td class="app-name-cell">${esc(r.app_name)}
                     ${r.app_status === "offline" ? '<span class="badge offline">已下线</span>' : ""}</td>
                   <td>${esc(r.business_line_name)}</td>
-                  <td><span class="env-tag ${esc(r.environment)}">${esc(state.meta.environments.find((e) => e.value === r.environment).label)}</span></td>
+                  <td><span class="env-tag ${esc(r.environment)}">${esc(r.environment_label || r.environment)}</span></td>
                   <td>${r.item_count} 项</td>
                   <td>${r.secret_count ? `<span class="secret-chip">🔒 ${r.secret_count}</span>` : '<span style="color:var(--ink-3)">—</span>'}</td>
                   <td><b>v${r.latest_version}</b>${r.latest_note ? `<div class="app-desc">${esc(r.latest_note)}</div>` : ""}</td>
@@ -813,7 +1460,10 @@ async function paintConfigProfile(appId, environment) {
     view.innerHTML = errorStateHtml(e.status === 403 ? "403 无权访问" : e.status === 404 ? "404 不存在" : "加载失败", e.message);
     return;
   }
-  const envTabs = state.meta.environments;
+  const envTabs = (data.env_permissions || []).map((m) => ({
+    value: m.environment, label: m.environment_label || m.environment,
+  }));
+  state.appEnvCache[appId] = data.env_permissions || [];
   const permsEnv = {};
   (data.env_permissions || []).forEach((m) => { permsEnv[m.environment] = m; });
   const curPerm = data.permissions || { can_edit: false, can_reveal: false };
@@ -880,7 +1530,7 @@ async function paintConfigProfile(appId, environment) {
   const diffBtn = $("#cp-diff-btn");
   diffBtn.onclick = () => {
     const visibleEnvs = (data.env_permissions || []).filter((m) => m.visible).map((m) => m.environment);
-    openEnvDiffModal(appId, environment, visibleEnvs);
+    openEnvDiffModal(appId, environment, visibleEnvs, envTabs);
   };
   const editBtn = $("#cp-edit-btn");
   if (editBtn) editBtn.onclick = () => openConfigEditor(appId, environment, data);
@@ -1043,7 +1693,7 @@ function openConfigEditor(appId, environment, data, prefill) {
   root.innerHTML = `
     <div class="modal-mask">
       <div class="modal" style="width:880px">
-        <h3>编辑配置 · ${esc(data.app_name)} · ${esc(state.meta.environments.find((e) => e.value === environment).label)}环境
+        <h3>编辑配置 · ${esc(data.app_name)} · ${esc(envLabelOf(environment, appId))}环境
           <span class="ver-base">基线 v${data.current_version}</span></h3>
         ${conflictKeys.size ? `<div class="conflict-hint">以下键双方都改过，当前保留的是服务器最新值，请逐项确认（标红行）：${esc([...conflictKeys].join("、"))}</div>` : ""}
         <p style="color:var(--ink-3);font-size:12px;margin:0 0 10px">整体保存后生成一个新版本；密文值留空表示「不修改原密文」。保存会再次校验版本，防止并发覆盖。</p>
@@ -1162,7 +1812,7 @@ function openConfigEditor(appId, environment, data, prefill) {
 /* ---------------- 并发编辑冲突（乐观锁 409） ---------------- */
 function openConfigConflictModal(appId, environment, p, draft, closeEditor) {
   const root = $("#modal-root");
-  const envLabel = state.meta.environments.find((e) => e.value === environment).label;
+  const envLabel = envLabelOf(environment, appId);
   const interesting = (p.entries || []).filter((e) => e.status !== "same");
   const meta = p.current_version_meta || {};
   root.innerHTML = `
@@ -1346,9 +1996,9 @@ function diffArrow(status) {
 }
 
 /* ---------------- 环境对比 ---------------- */
-function openEnvDiffModal(appId, curEnv, visibleEnvList) {
+function openEnvDiffModal(appId, curEnv, visibleEnvList, allEnvs) {
   const root = $("#modal-root");
-  const all = state.meta.environments;
+  const all = allEnvs && allEnvs.length ? allEnvs : state.meta.environments;
   const visSet = new Set(visibleEnvList && visibleEnvList.length
     ? visibleEnvList : all.map((e) => e.value));
   const visibleEnvs = all.filter((e) => visSet.has(e.value));
@@ -1390,7 +2040,7 @@ function openEnvDiffModal(appId, curEnv, visibleEnvList) {
 }
 
 function paintDiffResult(d) {
-  const envLabel = (v) => state.meta.environments.find((e) => e.value === v).label;
+  const envLabel = (v) => envLabelOf(v, appIdFromHash());
   const s = d.summary;
   const interesting = d.entries.filter((e) => e.status !== "same");
   const box = $("#df-result");
@@ -1419,16 +2069,35 @@ function paintDiffResult(d) {
 /* ---------------- 变更留痕 ---------------- */
 async function renderAudit() {
   const view = $("#view");
-  const f = state.auditFilters;
-  const isAdmin = state.user.role === "admin";
   view.innerHTML = `
     <div class="page-head">
       <div>
         <h2>变更留痕</h2>
-        <div class="sub">配置的每次改动：谁改的、改前改后是什么；密文值在留痕中同样脱敏</div>
+        <div class="sub">配置逐键流水 + 环境 / 发布窗口 / 实例健康留痕，均支持按应用与时间窗查询</div>
       </div>
-      <button class="btn primary" id="au-export">导出差异清单 CSV</button>
     </div>
+    <div class="admin-tabs">
+      <button class="adm-tab ${state.auditTab === "config" ? "active" : ""}" data-atab="config">配置改动流水</button>
+      <button class="adm-tab ${state.auditTab === "ops" ? "active" : ""}" data-atab="ops">环境 / 窗口 / 健康留痕</button>
+    </div>
+    <div id="audit-body"><div class="empty-tip">加载中…</div></div>`;
+  $$("[data-atab]", view).forEach((b) => {
+    b.onclick = () => {
+      state.auditTab = b.dataset.atab;
+      $$("[data-atab]", view).forEach((x) => x.classList.toggle("active", x === b));
+      if (state.auditTab === "config") renderConfigAudit();
+      else renderOpsAudit();
+    };
+  });
+  if (state.auditTab === "config") renderConfigAudit();
+  else renderOpsAudit();
+}
+
+async function renderConfigAudit() {
+  const body = $("#audit-body");
+  const f = state.auditFilters;
+  const isAdmin = state.user.role === "admin";
+  body.innerHTML = `
     <div class="panel filter-bar">
       <select id="au-bl" ${isAdmin ? "" : "disabled"}>
         <option value="">全部业务线</option>
@@ -1448,6 +2117,7 @@ async function renderAudit() {
       <input type="date" id="au-end" value="${esc(f.end)}" title="结束日期">
       <button class="btn primary" id="au-run">查询</button>
       <button class="btn" id="au-reset">重置</button>
+      <button class="btn" id="au-export">导出 CSV</button>
     </div>
     <div id="au-result"><div class="empty-tip">加载中…</div></div>`;
 
@@ -1519,7 +2189,7 @@ function paintAuditRows(rows) {
             <tr>
               <td class="nowrap">${fmtTime(r.created_at)}</td>
               <td class="app-name-cell">${esc(r.app_name)}<div class="app-desc">${esc(r.business_line_name)}</div></td>
-              <td><span class="env-tag ${esc(r.environment)}">${esc(r.environment_label)}</span></td>
+              <td><span class="env-tag ${envTagClass(r.environment)}">${esc(r.environment_label)}</span></td>
               <td><span class="action-tag ${esc(r.action)}">${esc(r.action_label)}</span>${r.is_secret ? ' <span title="涉及密文">🔒</span>' : ""}</td>
               <td class="mono">${esc(r.config_key || "—")}</td>
               <td class="mono audit-val">${r.old_value === null ? '<span class="diff-gone">—</span>' : esc(r.old_value)}</td>
@@ -1531,6 +2201,124 @@ function paintAuditRows(rows) {
       </table>
     </div>
     <p style="color:var(--ink-3);font-size:12px;margin:8px 2px">最多返回最近 500 条；如需完整流水请用「导出差异清单 CSV」。</p>`;
+}
+
+/* ---------------- 运维留痕（环境/窗口/发布/健康） ---------------- */
+const OPS_CATEGORIES = [
+  { value: "", label: "全部类别" },
+  { value: "env", label: "环境管理" },
+  { value: "window", label: "发布窗口 / 封网" },
+  { value: "deploy", label: "发布" },
+  { value: "instance", label: "实例健康" },
+];
+
+async function renderOpsAudit() {
+  const body = $("#audit-body");
+  const f = state.opsFilters;
+  const isAdmin = state.user.role === "admin";
+  body.innerHTML = `
+    <div class="panel filter-bar">
+      <select id="oa-bl" ${isAdmin ? "" : "disabled"}>
+        <option value="">全部业务线</option>
+        ${state.businessLines.map((b) => `<option value="${b.id}" ${String(b.id) === String(f.business_line_id) ? "selected" : ""}>${esc(b.name)}</option>`).join("")}
+      </select>
+      <input id="oa-app" placeholder="应用 ID（可留空）" value="${esc(f.app_id)}" style="width:130px">
+      <input id="oa-env" placeholder="环境标识，如 prod / c1" value="${esc(f.env_key)}" style="width:170px">
+      <select id="oa-cat">
+        ${OPS_CATEGORIES.map((c) => `<option value="${c.value}" ${f.category === c.value ? "selected" : ""}>${esc(c.label)}</option>`).join("")}
+      </select>
+      <input type="date" id="oa-start" value="${esc(f.start)}" title="开始日期">
+      <span style="color:var(--ink-3)">至</span>
+      <input type="date" id="oa-end" value="${esc(f.end)}" title="结束日期">
+      <button class="btn primary" id="oa-run">查询</button>
+      <button class="btn" id="oa-reset">重置</button>
+      <button class="btn" id="oa-export">导出 CSV</button>
+    </div>
+    <div id="oa-result"><div class="empty-tip">加载中…</div></div>`;
+
+  const buildParams = () => {
+    const p = new URLSearchParams();
+    if (isAdmin && $("#oa-bl").value) p.set("business_line_id", $("#oa-bl").value);
+    if ($("#oa-app").value.trim()) p.set("app_id", $("#oa-app").value.trim());
+    if ($("#oa-env").value.trim()) p.set("env_key", $("#oa-env").value.trim());
+    if ($("#oa-cat").value) p.set("category", $("#oa-cat").value);
+    if ($("#oa-start").value) p.set("start", $("#oa-start").value);
+    if ($("#oa-end").value) p.set("end", $("#oa-end").value);
+    return p;
+  };
+  const load = async () => {
+    try {
+      const rows = await api(`/api/ops/audit?${buildParams().toString()}`);
+      paintOpsRows(rows);
+    } catch (e) {
+      $("#oa-result").innerHTML = errorStateHtml("查询失败", e.message);
+    }
+  };
+  $("#oa-run").onclick = () => {
+    state.opsFilters = {
+      app_id: $("#oa-app").value.trim(), business_line_id: $("#oa-bl").value,
+      env_key: $("#oa-env").value.trim(), category: $("#oa-cat").value,
+      start: $("#oa-start").value, end: $("#oa-end").value,
+    };
+    load();
+  };
+  $("#oa-reset").onclick = () => {
+    state.opsFilters = { app_id: "", business_line_id: "", env_key: "", category: "", start: "", end: "" };
+    renderAudit();
+  };
+  $("#oa-export").onclick = () => {
+    fetch(`/api/ops/audit/export.csv?${buildParams().toString()}`, {
+      headers: { "X-Token": state.token },
+    }).then(async (res) => {
+      if (!res.ok) {
+        const d = await res.json().catch(() => ({}));
+        throw new Error(typeof d.detail === "string" ? d.detail : `导出失败（HTTP ${res.status}）`);
+      }
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url; a.download = `ops-changelog-${Date.now()}.csv`;
+      a.click();
+      URL.revokeObjectURL(url);
+    }).catch((e) => toast(e.message, "error"));
+  };
+  await load();
+}
+
+function paintOpsRows(rows) {
+  const box = $("#oa-result");
+  if (!rows.length) {
+    box.innerHTML = `<div class="panel panel-pad empty-tip">该时间窗内没有环境 / 窗口 / 健康相关留痕</div>`;
+    return;
+  }
+  box.innerHTML = `
+    <div class="panel table-wrap">
+      <table class="app-table audit-table">
+        <thead><tr>
+          <th>时间</th><th>应用</th><th>环境</th><th>类别</th><th>动作</th><th>对象</th>
+          <th>详情</th><th>操作人</th>
+        </tr></thead>
+        <tbody>
+          ${rows.map((r) => `
+            <tr class="ops-row cat-${esc(r.category)} act-${esc(r.action)}">
+              <td class="nowrap">${fmtTime(r.created_at)}</td>
+              <td class="app-name-cell">
+                ${r.app_id ? `<a href="#/env/${r.app_id}/${encodeURIComponent(r.env_key)}">${esc(r.app_name)}</a>` : esc(r.app_name)}
+                <div class="app-desc">${esc(r.business_line_name)}</div>
+              </td>
+              <td><span class="env-tag ${envTagClass(r.env_key)}">${esc(r.environment_label)}</span></td>
+              <td>${esc(r.category_label)}</td>
+              <td><span class="action-tag ops-${esc(r.action)}">${esc(r.action_label)}</span></td>
+              <td class="mono">${esc(r.target || "—")}</td>
+              <td class="reason-cell">${esc(r.detail)}</td>
+              <td class="nowrap">${esc(r.user_name)}</td>
+            </tr>`).join("")}
+        </tbody>
+      </table>
+    </div>
+    <p style="color:var(--ink-3);font-size:12px;margin:8px 2px">
+      包含：环境增删改名、发布窗口改动、节假日封网/解除、窗口外发布拦截、实例注册/重启/掉线/恢复。最多返回最近 500 条。
+    </p>`;
 }
 
 /* ---------------- 权限与交接 ---------------- */

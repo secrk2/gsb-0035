@@ -7,6 +7,7 @@
   交接前后负责人、发起人、时间、备注全部留痕；
 - 权限变更本身写 permission_logs，并在应用交接时同步写应用变更日志。
 """
+import re
 import time
 
 from fastapi import APIRouter
@@ -43,7 +44,11 @@ class TransferIn(BaseModel):
 # ---------------------------------------------------------------- 辅助
 
 def _env_label(env: str) -> str:
-    return "全部环境" if env == ENV_SCOPE_ALL else ENV_LABELS[env]
+    if env == ENV_SCOPE_ALL:
+        return "全部环境"
+    # 自定义环境（如灰度 c1）是应用级实体，权限明细处只能显示 key；
+    # 具体显示名以各应用环境管理页为准。
+    return ENV_LABELS.get(env, f"自定义环境 {env}")
 
 
 def _grant_row_to_dict(r) -> dict:
@@ -168,8 +173,9 @@ def change_user_role(user_id: int, body: RoleIn, actor: dict = User):
 def _validate_grant_target(actor: dict, target: dict, bl_id: int, env: str) -> None:
     if not query_one("SELECT id FROM business_lines WHERE id = ?", (bl_id,)):
         raise err(400, f"业务线 #{bl_id} 不存在")
-    if env != ENV_SCOPE_ALL and env not in ENV_LABELS:
-        raise err(400, f"非法环境：{env}")
+    if env != ENV_SCOPE_ALL and env not in ENV_LABELS \
+            and not re.fullmatch(r"c\d+", env):
+        raise err(400, f"非法环境：{env}（内置 dev/test/staging/prod 或应用自定义环境 c<n>）")
     # 业务线负责人只能给本业务线授权
     perms.ensure_can_manage_bl(actor, bl_id)
 

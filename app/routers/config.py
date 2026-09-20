@@ -5,6 +5,7 @@
 密文相关规则在服务端强制执行（仅前端拦截不算数）；
 配置保存带 expected_version 乐观锁，并发改动冲突时返回 409 与逐键差异，绝不静默覆盖。
 """
+import re
 import time
 from urllib.parse import quote
 
@@ -13,11 +14,12 @@ from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
 from .. import config_service as svc
+from .. import envs_service
 from .. import permissions as perms
 from ..auth import User, ensure_bl_visible, err, get_app_or_404
 from ..db import (
     CONFIG_SCOPE_LABELS, CONFIG_SCOPES, CONFIG_TYPE_LABELS, CONFIG_TYPES,
-    ENVIRONMENTS, TERMINAL_STATUS, query, query_one,
+    TERMINAL_STATUS, query, query_one,
 )
 
 router = APIRouter()
@@ -57,9 +59,17 @@ class RollbackIn(BaseModel):
 # ---------------------------------------------------------------- 辅助
 
 def env_checked(environment: str) -> str:
-    if environment not in ENVIRONMENTS:
-        raise err(400, f"非法环境：{environment}，可选：{'/'.join(ENVIRONMENTS)}")
+    """环境 key 格式校验；环境是否存在由 require_app_env 按应用判定（环境是应用级实体）。"""
+    if not re.fullmatch(r"[a-z0-9_]{1,16}", str(environment)):
+        raise err(400, f"非法环境标识：{environment}（应为小写字母/数字，如 dev、c1）")
     return environment
+
+
+def require_app_env(app_row: dict, env_key: str) -> None:
+    try:
+        envs_service.require_env(app_row["id"], env_key)
+    except LookupError as e:
+        raise err(404, str(e))
 
 
 def updater_names(item_rows: list[dict]) -> dict[int, str]:
@@ -81,9 +91,9 @@ def config_perms(user: dict, app_row: dict, env: str) -> dict:
         "can_edit": edit_ok,
         "can_reveal": reveal_ok,
         "edit_deny_reason": None if edit_ok else perms.deny_reason(
-            user, app_row["business_line_id"], env, "edit"),
+            user, app_row["business_line_id"], env, "edit", app_id=app_row["id"]),
         "reveal_deny_reason": None if reveal_ok else perms.deny_reason(
-            user, app_row["business_line_id"], env, "reveal"),
+            user, app_row["business_line_id"], env, "reveal", app_id=app_row["id"]),
     }
 
 
@@ -108,7 +118,9 @@ def list_profiles(user: dict = User,
     sql = """SELECT a.id AS app_id, a.name AS app_name, a.status AS app_status,
                     a.owner_id,
                     b.id AS business_line_id, b.name AS business_line_name,
-                    x.environment, x.version AS latest_version,
+                    x.environment,
+                    COALESCE(ae.label, x.environment) AS environment_label,
+                    x.version AS latest_version,
                     x.change_note AS latest_note, x.created_at AS latest_at,
                     u.name AS created_by_name,
                     (SELECT COUNT(*) FROM config_items ci
@@ -118,6 +130,7 @@ def list_profiles(user: dict = User,
              FROM config_versions x
              JOIN applications a ON a.id = x.app_id
              JOIN business_lines b ON b.id = a.business_line_id
+             LEFT JOIN app_environments ae ON ae.app_id = a.id AND ae.env_key = x.environment
              LEFT JOIN users u ON u.id = x.created_by
              WHERE x.version = (
                  SELECT MAX(y.version) FROM config_versions y
@@ -149,6 +162,7 @@ def list_profiles(user: dict = User,
 def get_config(app_id: int, environment: str, user: dict = User):
     app_row = get_app_or_404(app_id)
     env_checked(environment)
+    require_app_env(app_row, environment)
     # 配置可见性按"配置环境"收窄（可能只授予了某条业务线的生产环境）
     perms.ensure_config_perm(user, app_row, environment, "view")
     rows = svc.current_items(app_id, environment)
@@ -162,21 +176,23 @@ def get_config(app_id: int, environment: str, user: dict = User):
         "SELECT MAX(version) AS v FROM config_versions WHERE app_id = ? AND environment = ?",
         (app_id, environment),
     )["v"] or 0
-    # 四个环境各自的可见性/编辑权/密文权矩阵：前端据此把无权进入的环境标签置灰并给原因
+    # 该应用下的环境矩阵（含自定义环境）：前端据此把无权进入的环境标签置灰并给原因
     env_matrix = []
-    for env in ENVIRONMENTS:
+    for env_row in envs_service.list_app_envs(app_id):
+        env = env_row["env_key"]
         visible = (perms.is_admin(user) or perms.is_bl_owner(user, app_row["business_line_id"])
                    or app_row["id"] in user.get("_owned_apps", set())
                    or bool(perms._grant_match(perms.grants_of(user),
                                               app_row["business_line_id"], env, "view")))
-        entry = {"environment": env, "visible": visible}
+        entry = {"environment": env, "environment_label": env_row["label"],
+                 "is_builtin": bool(env_row["is_builtin"]), "visible": visible}
         if visible:
             entry.update(config_perms(user, app_row, env))
         else:
             entry.update({
                 "can_view": False, "can_edit": False, "can_reveal": False,
                 "view_deny_reason": perms.deny_reason(
-                    user, app_row["business_line_id"], env, "view"),
+                    user, app_row["business_line_id"], env, "view", app_id=app_id),
             })
         env_matrix.append(entry)
     return {
@@ -196,6 +212,7 @@ def get_config(app_id: int, environment: str, user: dict = User):
 def save_config(app_id: int, environment: str, body: SaveConfigIn, user: dict = User):
     app_row = get_app_or_404(app_id)
     env_checked(environment)
+    require_app_env(app_row, environment)
     # 编辑权独立于查看权与密文查看权：能看明文 ≠ 能改
     perms.ensure_config_perm(user, app_row, environment, "edit")
     if app_row["status"] == TERMINAL_STATUS:
@@ -217,6 +234,7 @@ def save_config(app_id: int, environment: str, body: SaveConfigIn, user: dict = 
 def rollback_config(app_id: int, body: RollbackIn, user: dict = User):
     app_row = get_app_or_404(app_id)
     env_checked(body.environment)
+    require_app_env(app_row, body.environment)
     perms.ensure_config_perm(user, app_row, body.environment, "edit")
     if app_row["status"] == TERMINAL_STATUS:
         raise err(400, "应用已下线（终态），配置档案只读，禁止回滚")
@@ -268,6 +286,8 @@ def diff_config(app_id: int, env_a: str, env_b: str, user: dict = User):
     app_row = get_app_or_404(app_id)
     env_checked(env_a)
     env_checked(env_b)
+    require_app_env(app_row, env_a)
+    require_app_env(app_row, env_b)
     if env_a == env_b:
         raise err(400, "环境对比必须选择两个不同的环境")
     # 两个环境都得在可见范围内
@@ -282,6 +302,7 @@ def diff_config(app_id: int, env_a: str, env_b: str, user: dict = User):
 def get_versions(app_id: int, environment: str, user: dict = User):
     app_row = get_app_or_404(app_id)
     env_checked(environment)
+    require_app_env(app_row, environment)
     perms.ensure_config_perm(user, app_row, environment, "view")
     return svc.list_versions(app_id, environment)
 
@@ -290,6 +311,7 @@ def get_versions(app_id: int, environment: str, user: dict = User):
 def get_version(app_id: int, version_no: int, environment: str, user: dict = User):
     app_row = get_app_or_404(app_id)
     env_checked(environment)
+    require_app_env(app_row, environment)
     perms.ensure_config_perm(user, app_row, environment, "view")
     try:
         return svc.version_detail(app_id, environment, version_no)
@@ -301,6 +323,7 @@ def get_version(app_id: int, version_no: int, environment: str, user: dict = Use
 def rollback_preview(app_id: int, environment: str, version: int, user: dict = User):
     app_row = get_app_or_404(app_id)
     env_checked(environment)
+    require_app_env(app_row, environment)
     # 预览是读操作，有查看权即可看到差异（真正回滚时再卡编辑权）
     perms.ensure_config_perm(user, app_row, environment, "view")
     try:

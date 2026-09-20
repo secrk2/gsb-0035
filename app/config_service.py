@@ -53,8 +53,17 @@ def mask_value(value, is_secret):
 
 
 def validate_environment(environment: str):
-    if environment not in ENV_LABELS:
-        raise ValueError(f"非法环境：{environment}，可选：{'/'.join(ENV_LABELS)}")
+    # 环境已改为应用级实体（app_environments），是否存在由路由层按应用校验；
+    # 这里只做 key 格式兜底，不再按全局枚举拒绝自定义环境（灰度/压测等）。
+    if not re.fullmatch(r"[a-z0-9_]{1,16}", str(environment)):
+        raise ValueError(f"非法环境标识：{environment}")
+
+
+def env_label(app_id: int, env_key: str) -> str:
+    """环境显示名：应用级自定义名优先，回落到内置中文名。"""
+    row = query_one("SELECT label FROM app_environments WHERE app_id = ? AND env_key = ?",
+                    (app_id, env_key))
+    return row["label"] if row else ENV_LABELS.get(env_key, env_key)
 
 
 def normalize_item(raw: dict) -> dict:
@@ -551,7 +560,7 @@ def audit_row_to_dict(r) -> dict:
         "app_name": r["app_name"],
         "business_line_name": r["business_line_name"],
         "environment": r["environment"],
-        "environment_label": ENV_LABELS[r["environment"]],
+        "environment_label": env_label(r["app_id"], r["environment"]),
         "action": r["action"],
         "action_label": ACTION_LABELS.get(r["action"], r["action"]),
         "config_key": r["config_key"],

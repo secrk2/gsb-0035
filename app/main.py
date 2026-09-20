@@ -8,16 +8,18 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from . import permissions as perms
+from . import envs_service
 from .auth import (
     User, ensure_bl_visible, err, get_app_checked, get_app_or_404,
     get_app_writable, is_admin, public_user,
 )
 from .db import (
-    CLUSTERS, ENV_LABELS, ENVIRONMENTS, ROLES, ROLE_LABELS, STATUS_LABELS, STATUS_ORDER,
-    STATUSES, TERMINAL_STATUS, execute, get_conn, init_db, query, query_one,
+    BUILTIN_ENVIRONMENTS, CLUSTERS, ENV_LABELS, ROLES, ROLE_LABELS, STATUS_LABELS,
+    STATUS_ORDER, STATUSES, TERMINAL_STATUS, execute, get_conn, init_db, query, query_one,
 )
 from .routers import admin as admin_router
 from .routers import config as config_router
+from .routers import ops as ops_router
 from .seed import seed_if_empty
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
@@ -25,6 +27,7 @@ STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 app = FastAPI(title="织云系统", docs_url=None, redoc_url=None)
 app.include_router(config_router.router)
 app.include_router(admin_router.router)
+app.include_router(ops_router.router)
 
 
 @app.on_event("startup")
@@ -48,6 +51,13 @@ def touch(app_id: int) -> None:
     execute("UPDATE applications SET updated_at = ? WHERE id = ?", (int(time.time()), app_id))
 
 
+def app_env_label(app_id: int, env_key: str) -> str:
+    """应用所属环境的显示名：应用级环境名优先，回落到内置环境中文名。"""
+    row = query_one("SELECT label FROM app_environments WHERE app_id = ? AND env_key = ?",
+                    (app_id, env_key))
+    return row["label"] if row else ENV_LABELS.get(env_key, env_key)
+
+
 def app_to_dict(row, with_env: bool = False) -> dict:
     app_id = row["id"]
     owner = query_one("SELECT id, name FROM users WHERE id = ?", (row["owner_id"],)) if row["owner_id"] else None
@@ -64,7 +74,7 @@ def app_to_dict(row, with_env: bool = False) -> dict:
         "owner_name": owner["name"] if owner else None,
         "cluster": row["cluster"],
         "environment": row["environment"],
-        "environment_label": ENV_LABELS[row["environment"]],
+        "environment_label": app_env_label(app_id, row["environment"]),
         "status": row["status"],
         "status_label": STATUS_LABELS[row["status"]],
         "description": row["description"],
@@ -155,7 +165,8 @@ def me(user: dict = User):
 @app.get("/api/meta")
 def meta(user: dict = User):
     return {
-        "environments": [{"value": e, "label": ENV_LABELS[e]} for e in ENVIRONMENTS],
+        # 内置环境用于新建应用/通用筛选；各应用自身环境（含自定义）走 /api/apps/{id}/environments
+        "environments": [{"value": e, "label": ENV_LABELS[e]} for e in BUILTIN_ENVIRONMENTS],
         "statuses": [{"value": s, "label": STATUS_LABELS[s]} for s in STATUSES],
         "clusters": CLUSTERS,
         "roles": [{"value": r, "label": ROLE_LABELS[r]} for r in ROLES],
@@ -232,8 +243,7 @@ def list_apps(user: dict = User,
         sql += " AND owner_id = ?"
         params.append(owner_id)
     if environment:
-        if environment not in ENVIRONMENTS:
-            raise err(400, f"非法环境：{environment}，可选：{'/'.join(ENVIRONMENTS)}")
+        # 环境为应用级实体后不再按全局枚举拦截；自定义环境 key（c1…）同样可筛
         sql += " AND environment = ?"
         params.append(environment)
     if status:
@@ -252,8 +262,8 @@ def list_apps(user: dict = User,
 def create_app(body: AppCreateIn, user: dict = User):
     # 新建应用属于业务线管理动作：平台管理员或该业务线负责人
     perms.ensure_can_manage_bl(user, body.business_line_id)
-    if body.environment not in ENVIRONMENTS:
-        raise err(400, f"非法环境：{body.environment}")
+    if body.environment not in BUILTIN_ENVIRONMENTS:
+        raise err(400, f"非法环境：{body.environment}（新建应用请选择内置环境，之后可在环境管理中增删自定义环境）")
     if body.cluster not in CLUSTERS:
         raise err(400, f"非法集群：{body.cluster}，可选：{'、'.join(CLUSTERS)}")
     if body.owner_id is not None:
@@ -278,6 +288,15 @@ def create_app(body: AppCreateIn, user: dict = User):
          body.environment, body.description.strip(), now, now),
     )
     log_change(cur.lastrowid, user["id"], "创建应用", f"应用「{body.name.strip()}」创建，初始状态：在研")
+    # 新应用默认挂四个内置环境；之后业务线可在环境管理里自行增删自定义环境
+    now_env = int(time.time())
+    for i, key in enumerate(BUILTIN_ENVIRONMENTS, start=1):
+        get_conn().execute(
+            """INSERT INTO app_environments (app_id, env_key, label, is_builtin, sort_no, created_at)
+               VALUES (?,?,?,1,?,?)""",
+            (cur.lastrowid, key, ENV_LABELS[key], i * 10, now_env),
+        )
+    get_conn().commit()
     return app_to_dict(get_app_or_404(cur.lastrowid), with_env=True)
 
 
@@ -339,10 +358,14 @@ def update_app(app_id: int, body: AppUpdateIn, user: dict = User):
             raise err(400, f"非法集群：{body.cluster}")
         changes.append(("cluster", body.cluster, f"集群变更：{app_row['cluster']} → {body.cluster}"))
     if body.environment is not None and body.environment != app_row["environment"]:
-        if body.environment not in ENVIRONMENTS:
-            raise err(400, f"非法环境：{body.environment}")
+        env_row = query_one(
+            "SELECT label FROM app_environments WHERE app_id = ? AND env_key = ?",
+            (app_id, body.environment),
+        )
+        if not env_row:
+            raise err(400, f"非法环境：{body.environment}；该应用下没有此环境，请先在环境管理中新建")
         changes.append(("environment", body.environment,
-                        f"环境变更：{ENV_LABELS[app_row['environment']]} → {ENV_LABELS[body.environment]}"))
+                        f"环境变更：{app_env_label(app_id, app_row['environment'])} → {env_row['label']}"))
     if body.description is not None and body.description.strip() != app_row["description"]:
         changes.append(("description", body.description.strip(), "更新应用描述"))
     for field, value, _log in changes:
@@ -457,6 +480,16 @@ def console_summary(user: dict = User):
         if not query_one("SELECT id FROM env_vars WHERE app_id = ? LIMIT 1", (row["id"],)):
             missing_env.append(app_to_dict(row))
 
+    # 健康告警：掉线 / 反复重启实例跨应用直接冒出来，带业务线 × 环境标识
+    if is_admin(user):
+        health_scope_sql, health_scope_params = "1=1", []
+    else:
+        health_scope_sql, health_scope_params = perms.scope_condition(
+            user, "a.business_line_id", "i.env_key", "a.owner_id"
+        )
+    health_alerts = envs_service.health_alerts_rows(health_scope_sql, health_scope_params)
+    health_totals = envs_service.health_overview(health_scope_sql, health_scope_params)
+
     return {
         "by_business_line": [dict(r) for r in by_bl],
         "recent_changed_apps": [dict(r) for r in recent],
@@ -464,11 +497,15 @@ def console_summary(user: dict = User):
             "missing_owner": missing_owner,
             "missing_env": missing_env,
         },
+        "health_alerts": health_alerts,
+        "health_totals": health_totals,
         "totals": {
             "apps": len(apps),
             "business_lines": len(by_bl),
             "recent_changed": len(recent),
             "red_dot_apps": len({a["id"] for a in missing_owner} | {a["id"] for a in missing_env}),
+            "offline_instances": health_totals["instance_stopped"],
+            "crash_loop_instances": health_totals["crash_loop_instances"],
         },
     }
 

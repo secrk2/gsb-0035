@@ -141,8 +141,20 @@ def _bl_name(bl_id: int) -> str:
     return row["name"] if row else f"#{bl_id}"
 
 
+def _env_name(bl_id: int | None, env: str | None, app_id: int | None = None) -> str:
+    """环境显示名：应用级自定义名（灰度等）→ 内置中文名 → key 原样。"""
+    if env is None:
+        return ""
+    if app_id is not None:
+        row = query_one("SELECT label FROM app_environments WHERE app_id = ? AND env_key = ?",
+                        (app_id, env))
+        if row:
+            return row["label"]
+    return ENV_LABELS.get(env, env)
+
+
 def deny_reason(user: dict, bl_id: int, env: str | None, perm: str,
-                owns_app: bool = False) -> str:
+                owns_app: bool = False, app_id: int | None = None) -> str:
     """生成越权说明：业务线级 / 环境级 / 权限级 三层原因。
 
     owns_app 表示用户是否拥有"本次被访问的那个具体应用"（而非该业务线下任意应用）：
@@ -151,6 +163,7 @@ def deny_reason(user: dict, bl_id: int, env: str | None, perm: str,
     who = role_label(user)
     bl_name = _bl_name(bl_id)
     grants = grants_of(user)
+    env_disp = _env_name(bl_id, env, app_id)
 
     # 1) 整条业务线都不在任何可见范围内
     if bl_id not in visible_business_lines(user):
@@ -163,23 +176,29 @@ def deny_reason(user: dict, bl_id: int, env: str | None, perm: str,
 
     # 2) 业务线在范围内，但目标环境没授权（拥有本次访问的具体应用时除外——那种情况下不会被拦到这里）
     view_envs = _granted_envs(grants, bl_id, "view")
-    if env is not None and not is_bl_owner(user, bl_id) and not owns_app and env not in view_envs:
-        env_txt = "、".join(ENV_LABELS[e] for e in view_envs) if view_envs else "无"
-        return (f"越权访问：你在业务线「{bl_name}」只有【{env_txt}】环境的访问权，"
-                f"【{ENV_LABELS[env]}】环境不在授权范围内。")
+    if env is not None and not is_bl_owner(user, bl_id) and not owns_app:
+        if not _grant_match(grants, bl_id, env, "view"):
+            has_star = any(g["business_line_id"] == bl_id and g["environment"] == ENV_SCOPE_ALL
+                           and g["can_view_config"] for g in grants)
+            if has_star:
+                env_txt = "全部环境"
+            else:
+                env_txt = "、".join(_env_name(bl_id, e) for e in view_envs) if view_envs else "无"
+            return (f"越权访问：你在业务线「{bl_name}」只有【{env_txt}】环境的访问权，"
+                    f"【{env_disp}】环境不在授权范围内。")
 
     # 3) 环境能看，但缺具体权限
     if perm == "edit":
         if user["role"] == "viewer":
             return (f"禁止修改：你的账号是「只读观察者」，对「{bl_name}"
-                    + (f"·{ENV_LABELS[env]}" if env else "")
+                    + (f"·{env_disp}" if env else "")
                     + "」只有查看权，没有配置编辑权。")
         return (f"禁止修改：你的账号在「{bl_name}"
-                f"·{ENV_LABELS[env] if env else '全部环境'}」只有查看权（密文脱敏展示），"
+                f"·{env_disp if env else '全部环境'}」只有查看权（密文脱敏展示），"
                 f"没有配置编辑权；能查看不等于能修改。请联系业务线负责人或平台管理员授予编辑权。")
     if perm == "reveal":
         return (f"禁止查看明文：你的账号在「{bl_name}"
-                f"·{ENV_LABELS[env] if env else '全部环境'}」没有密文查看权。"
+                f"·{env_disp if env else '全部环境'}」没有密文查看权。"
                 f"密文查看权与配置查看/编辑权分开授予，能看脱敏值或能改配置都不代表能看明文，"
                 f"请向业务线负责人或平台管理员单独申请密文查看权。")
     return f"越权访问：你没有「{bl_name}」的访问权限。"
@@ -197,7 +216,7 @@ def ensure_app_visible(user: dict, app_row: dict) -> None:
         return
     from .auth import err
     raise err(403, deny_reason(user, app_row["business_line_id"], app_row["environment"],
-                               "view", owns_app=owns))
+                               "view", owns_app=owns, app_id=app_row["id"]))
 
 
 def ensure_config_perm(user: dict, app_row: dict, env: str, perm: str) -> None:
@@ -214,7 +233,8 @@ def ensure_config_perm(user: dict, app_row: dict, env: str, perm: str) -> None:
         ok = is_owner or bool(_grant_match(grants, bl_id, env, "view"))
     elif perm == "edit":
         if user["role"] == "viewer":
-            raise err(403, deny_reason(user, bl_id, env, "edit", owns_app=is_owner))
+            raise err(403, deny_reason(user, bl_id, env, "edit", owns_app=is_owner,
+                                       app_id=app_row["id"]))
         ok = is_owner or bool(_grant_match(grants, bl_id, env, "edit"))
     elif perm == "reveal":
         # 应用负责人默认也不能看明文：密文权必须单独授予
@@ -222,7 +242,8 @@ def ensure_config_perm(user: dict, app_row: dict, env: str, perm: str) -> None:
     else:  # pragma: no cover - 防御
         ok = False
     if not ok:
-        raise err(403, deny_reason(user, bl_id, env, perm, owns_app=is_owner))
+        raise err(403, deny_reason(user, bl_id, env, perm, owns_app=is_owner,
+                                   app_id=app_row["id"]))
 
 
 def can_reveal(user: dict, bl_id: int, env: str) -> bool:
@@ -286,7 +307,8 @@ def permission_summary(user: dict) -> dict:
             "business_line_id": g["business_line_id"],
             "business_line_name": g["business_line_name"],
             "environment": g["environment"],
-            "environment_label": "全部环境" if g["environment"] == ENV_SCOPE_ALL else ENV_LABELS[g["environment"]],
+            "environment_label": "全部环境" if g["environment"] == ENV_SCOPE_ALL
+            else ENV_LABELS.get(g["environment"], f"自定义环境 {g['environment']}"),
             "can_view_config": bool(g["can_view_config"]),
             "can_edit_config": bool(g["can_edit_config"]) and user["role"] != "viewer",
             "can_reveal": bool(g["can_reveal"]),

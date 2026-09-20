@@ -168,6 +168,7 @@ def seed_if_empty() -> bool:
 
     seed_config_profiles(app_ids, user_ids, now)
     seed_transfers(app_ids, user_ids, bl_ids, now)
+    seed_envs_windows_instances(app_ids, user_ids, bl_ids, now)
     return True
 
 
@@ -404,4 +405,266 @@ def seed_transfers(app_ids: dict, user_ids: dict, bl_ids: dict, now: int) -> Non
     permlog("admin", "sunlei", "transfer", "应用「离线调度平台」",
             "应用交接：负责人 周婷 → 孙磊；交接前负责人：周婷，交接后负责人：孙磊；"
             "配置项随应用一并移交" + ("；交接备注：" + note if note else ""), ts)
+
+
+# ---------------------------------------------------------------- 环境 / 窗口 / 健康种子
+
+# 自定义环境样例（应用名, env_key, 显示名）
+CUSTOM_ENVS = [
+    ("支付网关", "c1", "灰度"),
+    ("会员中心", "c1", "灰度"),
+    ("实时数仓", "c1", "压测"),
+]
+
+# 周计划窗口（0=周一 … 6=周日，时间为本地 HH:MM）
+PROD_WINDOW_DEFAULT = [(0, "10:00", "18:00"), (1, "10:00", "18:00"), (2, "10:00", "18:00"),
+                       (3, "10:00", "18:00"), (4, "10:00", "18:00")]
+PROD_WINDOW_STRICT = [(1, "10:00", "12:00"), (1, "14:00", "17:00"),
+                      (3, "10:00", "12:00"), (3, "14:00", "17:00")]
+STAGING_WINDOW = [(0, "09:00", "19:00"), (1, "09:00", "19:00"), (2, "09:00", "19:00"),
+                  (3, "09:00", "19:00"), (4, "09:00", "19:00")]
+
+# 显式编排的实例样例：
+# (应用, 环境, 节点, 状态, 注册距今天数, 重启模式, 掉线距今天数(仅 stopped), 备注)
+#   重启模式：none / normal(n) / frequent(n) / crash(n)，括号内为近 24h（frequent/crash）或累计（normal）次数
+INSTANCE_SCENARIOS = [
+    ("支付网关", "prod", "pay-gw-01", "running", 40, ("normal", 4), None, ""),
+    ("支付网关", "prod", "pay-gw-02", "running", 40, ("normal", 6), None, ""),
+    ("支付网关", "prod", "pay-gw-03", "running", 25, ("normal", 2), None, ""),
+    ("支付网关", "prod", "pay-gw-04", "running", 25, ("normal", 3), None, ""),
+    ("风控实时引擎", "prod", "risk-01", "running", 35, ("normal", 5), None, ""),
+    ("风控实时引擎", "prod", "risk-02", "running", 35, ("normal", 3), None, ""),
+    ("风控实时引擎", "prod", "risk-03", "stopped", 35, ("normal", 7), 0.08,
+     "心跳超时连续 3 次，节点不可达"),
+    ("会员中心", "prod", "member-01", "running", 30, ("normal", 3), None, ""),
+    ("会员中心", "prod", "member-02", "running", 30, ("normal", 2), None, ""),
+    ("消息推送中心", "prod", "growth-push-01", "running", 28, ("normal", 4), None, ""),
+    # 反复重启样例：24 小时内重启 8 次，最后一次 12 分钟前 —— 与正常重启明确分级
+    ("消息推送中心", "prod", "growth-push-02", "running", 28, ("crash", 8), None,
+     "疑似新版本内存泄漏，反复触发健康检查失败重启"),
+    ("订单履约中心", "prod", "ofc-01", "running", 26, ("normal", 2), None, ""),
+    ("订单履约中心", "prod", "ofc-02", "running", 26, ("normal", 3), None, ""),
+    ("订单履约中心", "prod", "ofc-03", "running", 18, ("normal", 1), None, ""),
+    ("仓储管理 WMS", "prod", "wms-01", "running", 33, ("normal", 2), None, ""),
+    # 掉线样例：已掉线 26 小时
+    ("仓储管理 WMS", "prod", "wms-02", "stopped", 33, ("normal", 4), 1.1,
+     "节点硬件故障宕机，等待机房更换主板"),
+    ("库存中台", "prod", "stock-01", "running", 20, ("normal", 2), None, ""),
+    ("库存中台", "prod", "stock-02", "running", 20, ("normal", 1), None, ""),
+    ("实时数仓", "prod", "dw-jm-01", "running", 22, ("normal", 3), None, ""),
+    # 重启偏多样例：24 小时内 3 次（黄色关注，区别于反复重启）
+    ("实时数仓", "prod", "dw-jm-02", "running", 22, ("frequent", 3), None,
+     "Checkpoint 超时导致 TaskManager 重启，持续观察中"),
+    ("离线调度平台", "prod", "sched-01", "running", 31, ("normal", 5), None, ""),
+    ("离线调度平台", "prod", "sched-02", "running", 31, ("normal", 4), None, ""),
+    ("BI 报表平台", "prod", "bi-01", "running", 24, ("normal", 1), None, ""),
+    ("标签画像平台", "staging", "tag-01", "running", 16, ("normal", 2), None, ""),
+    ("运输调度 TMS", "staging", "tms-01", "running", 15, ("normal", 1), None, ""),
+    ("裂变活动平台", "staging", "growth-camp-01", "running", 8, ("normal", 1), None, ""),
+    ("收银台 H5", "staging", "cashier-h5-01", "running", 12, ("normal", 2), None, ""),
+    ("增长实验平台", "dev", "exp-dev-01", "running", 5, ("none", 0), None, ""),
+    ("数据质量中心", "dev", "dq-dev-01", "running", 3, ("normal", 1), None, ""),
+]
+
+WEEKDAY_CN = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+
+
+def seed_envs_windows_instances(app_ids: dict, user_ids: dict, bl_ids: dict, now: int) -> None:
+    """应用级环境、发布窗口、节假日封网、实例与健康事件、运维留痕的初始样例。"""
+    app_bl = {name: bl_code for name, bl_code, *_ in APPS}
+    app_status = {name: status for name, _b, _o, _c, _e, status, *_ in APPS}
+
+    def bl_id_of(app_name):
+        return bl_ids[app_bl[app_name]]
+
+    def opslog(app_name, env_key, category, action, target, detail, actor, ts):
+        execute(
+            """INSERT INTO ops_event_logs
+               (app_id, business_line_id, env_key, category, action, target, detail, actor_id, created_at)
+               VALUES (?,?,?,?,?,?,?,?,?)""",
+            (app_ids[app_name], bl_id_of(app_name), env_key, category, action,
+             target, detail, user_ids.get(actor), ts),
+        )
+
+    def inst_event(inst_id, app_name, env_key, etype, actor, note, ts):
+        execute(
+            """INSERT INTO instance_events
+               (instance_id, app_id, env_key, event_type, actor_id, note, created_at)
+               VALUES (?,?,?,?,?,?,?)""",
+            (inst_id, app_ids[app_name], env_key, etype,
+             user_ids.get(actor) if actor else None, note, ts),
+        )
+
+    # 1) 每个应用四个内置环境
+    created0 = now - 60 * DAY
+    for idx, (name, *_rest) in enumerate(APPS):
+        app_id = app_ids[name]
+        for sort_no, key in enumerate(["dev", "test", "staging", "prod"], start=1):
+            execute(
+                """INSERT INTO app_environments (app_id, env_key, label, is_builtin, sort_no, created_at)
+                   VALUES (?,?,?,1,?,?)""",
+                (app_id, key,
+                 {"dev": "开发", "test": "测试", "staging": "预发", "prod": "生产"}[key],
+                 sort_no * 10, created0),
+            )
+
+    # 2) 自定义环境 + 留痕
+    for name, key, label in CUSTOM_ENVS:
+        execute(
+            """INSERT INTO app_environments (app_id, env_key, label, is_builtin, sort_no, created_at)
+               VALUES (?,?,?,0,101,?)""",
+            (app_ids[name], key, label, now - 4 * DAY),
+        )
+        opslog(name, key, "env", "env_create", label,
+               f"新建自定义环境「{label}」（标识 {key}），用于小流量灰度发布",
+               {"支付网关": "zhangwei", "会员中心": "wangqiang", "实时数仓": "sunlei"}[name],
+               now - 4 * DAY)
+
+    # 3) 发布窗口：在线/维保应用配 prod/staging 周计划；在研/下线不设
+    def set_windows(name, env_key, rules, actor, days_ago, note_hint):
+        ts = now - days_ago * DAY
+        for wd, st, et in rules:
+            execute(
+                """INSERT INTO deploy_windows (app_id, env_key, weekday, start_time, end_time, created_at)
+                   VALUES (?,?,?,?,?,?)""",
+                (app_ids[name], env_key, wd, st, et, ts),
+            )
+        plan = "；".join(
+            f"{WEEKDAY_CN[wd]} {st}~{et}" for wd, st, et in sorted(set(rules)))
+        opslog(name, env_key, "window", "window_update",
+               {"prod": "生产", "staging": "预发"}.get(env_key, env_key),
+               f"设置发布窗口：{plan}（{note_hint}）", actor, ts)
+
+    online_apps = [n for n in app_ids if app_status[n] in ("online", "maintenance")]
+    for name in online_apps:
+        if name == "支付网关":
+            set_windows(name, "prod", PROD_WINDOW_STRICT, "zhangwei", 9,
+                        "支付类应用收紧到周二/周四工作时段")
+        else:
+            owner = next((o for n, _b, o, *_ in APPS if n == name), None) or "admin"
+            set_windows(name, "prod", PROD_WINDOW_DEFAULT, owner, 7,
+                        "仅工作日工作时段允许生产发布")
+        set_windows(name, "staging", STAGING_WINDOW, "admin", 7, "预发每日工作时段可发布")
+
+    # 一条窗口调整留痕（昨天张伟把支付网关周二窗口从 09:30 推迟到 10:00）
+    opslog("支付网关", "prod", "window", "window_update", "生产",
+           "调整发布窗口：周二窗口开始时间 09:30 → 10:00（与值班交接时间对齐）",
+           "zhangwei", now - DAY)
+
+    # 4) 节假日封网
+    def add_block(name, env_key, date_str, reason, actor, ts):
+        execute(
+            """INSERT INTO deploy_window_blocks (app_id, env_key, block_date, reason, created_by, created_at)
+               VALUES (?,?,?,?,?,?)""",
+            (app_ids[name], env_key, date_str, reason, user_ids[actor], ts),
+        )
+        opslog(name, env_key, "window", "block_add",
+               {"prod": "生产", "staging": "预发"}.get(env_key, env_key),
+               f"新增封网日：{date_str} 全天禁止发布（原因：{reason}）", actor, ts)
+
+    for d in range(1, 8):
+        add_block("支付网关", "prod", f"2026-10-0{d}", "国庆假期封网，线上变更冻结",
+                  "zhangwei", now - 5 * DAY)
+    # 相对时间的封网日：明天全链路压测封网（保证任意日期演示都有临近封网）
+    tomorrow = time.localtime(now + DAY)
+    add_block("支付网关", "prod", time.strftime("%Y-%m-%d", tomorrow),
+              "全链路压测，压测窗口内禁止发布", "zhangwei", now - 2 * DAY)
+    # 已过去的封网日（留痕样例）
+    past = time.localtime(now - 2 * DAY)
+    add_block("仓储管理 WMS", "prod", time.strftime("%Y-%m-%d", past),
+              "季度盘点，仓储链路冻结", "zhaomin", now - 4 * DAY)
+
+    # 5) 实例 + 事件
+    seeded_apps: set[str] = set()
+    for name, env_key, node, status, created_days, rmode, offline_days, note in INSTANCE_SCENARIOS:
+        seeded_apps.add(name)
+        created_ts = now - int(created_days * DAY)
+        cur = execute(
+            """INSERT INTO app_instances
+               (app_id, env_key, node_name, status, restart_count, last_restart_at, created_at)
+               VALUES (?,?,?,?,0,NULL,?)""",
+            (app_ids[name], env_key, node, status, created_ts),
+        )
+        inst_id = cur.lastrowid
+        owner = next((o for n, _b, o, *_ in APPS if n == name), None) or "admin"
+        inst_event(inst_id, name, env_key, "register", None, "实例注册上线", created_ts)
+        opslog(name, env_key, "instance", "register", node, "新实例注册并上线", None, created_ts)
+
+        kind, count = rmode
+        restart_times: list[int] = []
+        if kind == "normal" and count:
+            # 均匀撒在创建后到 3 天前之间，避免与"近期"混淆
+            span = max(1, created_days - 3)
+            for i in range(count):
+                ts = now - int((3 + span * (i + 1) / (count + 1)) * DAY)
+                restart_times.append(ts)
+        elif kind in ("frequent", "crash"):
+            # 近 24h 内：frequent 间隔数小时，crash 密集
+            if kind == "frequent":
+                offsets_h = [20, 9, 2]
+            else:
+                offsets_h = [23, 20, 17, 14, 11, 8, 5, 0.2]
+            for h in offsets_h[:count]:
+                restart_times.append(now - int(h * 3600))
+
+        for ts in sorted(restart_times):
+            inst_event(inst_id, name, env_key, "restart", owner,
+                       "发布后重启" if kind != "crash" else "健康检查失败，容器被拉起重启", ts)
+            # 运维留痕只保留近 7 天的重启，避免流水过长
+            if now - ts <= 7 * DAY:
+                opslog(name, env_key, "instance", "restart", node,
+                       "健康检查失败，容器被自动拉起重启" if kind == "crash" else "实例重启",
+                       owner, ts)
+        if restart_times:
+            execute("UPDATE app_instances SET restart_count = ?, last_restart_at = ? WHERE id = ?",
+                    (len(restart_times), max(restart_times), inst_id))
+
+        if status == "stopped":
+            offline_ts = now - int(offline_days * DAY)
+            execute("UPDATE app_instances SET status = 'stopped' WHERE id = ?", (inst_id,))
+            inst_event(inst_id, name, env_key, "offline", None, note, offline_ts)
+            opslog(name, env_key, "instance", "offline", node,
+                   f"实例掉线（监测发现/人工摘除）：{note}", None, offline_ts)
+
+    # risk-01 补一段"掉线后恢复"历史，演示状态可回溯
+    risk = query_one(
+        "SELECT id FROM app_instances WHERE node_name = 'risk-01'",
+    )
+    if risk:
+        ts_off = now - 10 * DAY
+        ts_rec = now - 10 * DAY + 3600
+        inst_event(risk["id"], "风控实时引擎", "prod", "offline", None,
+                   "网络抖动导致心跳丢失", ts_off)
+        inst_event(risk["id"], "风控实时引擎", "prod", "recover", "zhangwei",
+                   "网络恢复，实例重新就绪", ts_rec)
+        opslog("风控实时引擎", "prod", "instance", "recover", "risk-01",
+               "实例恢复上线：网络恢复，实例重新就绪", "zhangwei", ts_rec)
+
+    # 6) 其余在线/维保应用补一个健康实例（prod），在研应用补 dev 实例
+    for name in online_apps:
+        if name in seeded_apps:
+            continue
+        node = f"{app_bl[name]}-app{app_ids[name]:02d}-01"
+        ts = now - 6 * DAY
+        cur = execute(
+            """INSERT INTO app_instances
+               (app_id, env_key, node_name, status, restart_count, last_restart_at, created_at)
+               VALUES (?, 'prod', ?, 'running', 1, ?, ?)""",
+            (app_ids[name], node, now - 2 * DAY, ts),
+        )
+        inst_event(cur.lastrowid, name, "prod", "register", None, "实例注册上线", ts)
+        inst_event(cur.lastrowid, name, "prod", "restart",
+                   next((o for n, _b, o, *_ in APPS if n == name), None),
+                   "例行发布重启", now - 2 * DAY)
+    for name, _b, _o, _c, home_env, status, *_ in APPS:
+        if status != "developing" or name in seeded_apps:
+            continue
+        node = f"{app_bl[name]}-dev-{app_ids[name]:02d}"
+        cur = execute(
+            """INSERT INTO app_instances
+               (app_id, env_key, node_name, status, restart_count, last_restart_at, created_at)
+               VALUES (?, ?, ?, 'running', 0, NULL, ?)""",
+            (app_ids[name], home_env, node, now - DAY),
+        )
+        inst_event(cur.lastrowid, name, home_env, "register", None, "开发实例注册", now - DAY)
 
