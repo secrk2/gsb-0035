@@ -13,11 +13,12 @@ from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
 from .. import config_service as svc
+from .. import env_service as esvc
 from .. import permissions as perms
 from ..auth import User, ensure_bl_visible, err, get_app_or_404
 from ..db import (
     CONFIG_SCOPE_LABELS, CONFIG_SCOPES, CONFIG_TYPE_LABELS, CONFIG_TYPES,
-    ENVIRONMENTS, TERMINAL_STATUS, query, query_one,
+    TERMINAL_STATUS, query, query_one,
 )
 
 router = APIRouter()
@@ -57,9 +58,23 @@ class RollbackIn(BaseModel):
 # ---------------------------------------------------------------- 辅助
 
 def env_checked(environment: str) -> str:
-    if environment not in ENVIRONMENTS:
-        raise err(400, f"非法环境：{environment}，可选：{'/'.join(ENVIRONMENTS)}")
+    """环境键的基本形态校验（环境已从写死枚举改为每应用注册表，具体归属在各接口按应用校验）。"""
+    import re as _re
+    if not _re.fullmatch(r"[a-z0-9_-]{1,32}", environment or ""):
+        raise err(400, f"非法环境标识：{environment}")
     return environment
+
+
+def app_env_or_400(app_id: int, environment: str):
+    """校验该环境确实注册在该应用下，返回 app_environments 行。"""
+    env_checked(environment)
+    row = query_one(
+        "SELECT * FROM app_environments WHERE app_id=? AND env_key=?",
+        (app_id, environment),
+    )
+    if not row:
+        raise err(400, f"该应用下不存在环境「{environment}」，请先在环境管理中新增")
+    return row
 
 
 def updater_names(item_rows: list[dict]) -> dict[int, str]:
@@ -148,7 +163,7 @@ def list_profiles(user: dict = User,
 @router.get("/api/apps/{app_id}/config")
 def get_config(app_id: int, environment: str, user: dict = User):
     app_row = get_app_or_404(app_id)
-    env_checked(environment)
+    env_row = app_env_or_400(app_id, environment)
     # 配置可见性按"配置环境"收窄（可能只授予了某条业务线的生产环境）
     perms.ensure_config_perm(user, app_row, environment, "view")
     rows = svc.current_items(app_id, environment)
@@ -162,14 +177,21 @@ def get_config(app_id: int, environment: str, user: dict = User):
         "SELECT MAX(version) AS v FROM config_versions WHERE app_id = ? AND environment = ?",
         (app_id, environment),
     )["v"] or 0
-    # 四个环境各自的可见性/编辑权/密文权矩阵：前端据此把无权进入的环境标签置灰并给原因
+    # 环境矩阵按该应用"已注册"的环境给出（含自定义环境）：前端据此渲染环境标签与置灰原因
+    env_rows = query(
+        "SELECT id, env_key, env_label FROM app_environments WHERE app_id=? ORDER BY "
+        "CASE env_key WHEN 'dev' THEN 0 WHEN 'test' THEN 1 WHEN 'staging' THEN 2 "
+        "WHEN 'prod' THEN 3 ELSE 4 END, id",
+        (app_id,),
+    )
     env_matrix = []
-    for env in ENVIRONMENTS:
+    for er in env_rows:
+        env = er["env_key"]
         visible = (perms.is_admin(user) or perms.is_bl_owner(user, app_row["business_line_id"])
                    or app_row["id"] in user.get("_owned_apps", set())
                    or bool(perms._grant_match(perms.grants_of(user),
                                               app_row["business_line_id"], env, "view")))
-        entry = {"environment": env, "visible": visible}
+        entry = {"environment": env, "environment_label": er["env_label"], "visible": visible}
         if visible:
             entry.update(config_perms(user, app_row, env))
         else:
@@ -179,6 +201,8 @@ def get_config(app_id: int, environment: str, user: dict = User):
                     user, app_row["business_line_id"], env, "view"),
             })
         env_matrix.append(entry)
+    # 当前环境发布窗口（配置页提示条 + 窗口外拦截依据）
+    window = esvc.evaluate_window(app_env_or_400(app_id, environment))
     return {
         "app_id": app_id,
         "app_name": app_row["name"],
@@ -189,17 +213,23 @@ def get_config(app_id: int, environment: str, user: dict = User):
         "current_version": latest_no,
         "permissions": config_perms(user, app_row, environment),
         "env_permissions": env_matrix,
+        "window": window,
     }
 
 
 @router.put("/api/apps/{app_id}/config")
 def save_config(app_id: int, environment: str, body: SaveConfigIn, user: dict = User):
     app_row = get_app_or_404(app_id)
-    env_checked(environment)
+    app_env_or_400(app_id, environment)
     # 编辑权独立于查看权与密文查看权：能看明文 ≠ 能改
     perms.ensure_config_perm(user, app_row, environment, "edit")
     if app_row["status"] == TERMINAL_STATUS:
         raise err(400, "应用已下线（终态），配置档案只读，禁止修改")
+    # 发布窗口卡口：窗口外的上线（配置发布）一律拦下，并告知下一次开放时间
+    try:
+        esvc.ensure_window_open(app_id, environment, actor_id=user["id"])
+    except esvc.WindowClosedError as e:
+        raise err(409, e.payload["message"], e.payload)
     try:
         items = svc.validate_items([it.model_dump() for it in body.items])
         result = svc.save_profile(app_id, environment, items, user,
@@ -216,10 +246,15 @@ def save_config(app_id: int, environment: str, body: SaveConfigIn, user: dict = 
 @router.post("/api/apps/{app_id}/config/rollback", status_code=201)
 def rollback_config(app_id: int, body: RollbackIn, user: dict = User):
     app_row = get_app_or_404(app_id)
-    env_checked(body.environment)
+    app_env_or_400(app_id, body.environment)
     perms.ensure_config_perm(user, app_row, body.environment, "edit")
     if app_row["status"] == TERMINAL_STATUS:
         raise err(400, "应用已下线（终态），配置档案只读，禁止回滚")
+    # 回滚同样是向生产追加一个新版本，属于上线动作，窗口外一并拦截
+    try:
+        esvc.ensure_window_open(app_id, body.environment, actor_id=user["id"])
+    except esvc.WindowClosedError as e:
+        raise err(409, e.payload["message"], e.payload)
     try:
         result = svc.rollback(app_id, body.environment, body.version, user,
                               expected_version=body.expected_version)
@@ -266,8 +301,8 @@ def reveal_secret(app_id: int, body: RevealIn, user: dict = User):
 @router.get("/api/apps/{app_id}/config/diff")
 def diff_config(app_id: int, env_a: str, env_b: str, user: dict = User):
     app_row = get_app_or_404(app_id)
-    env_checked(env_a)
-    env_checked(env_b)
+    app_env_or_400(app_id, env_a)
+    app_env_or_400(app_id, env_b)
     if env_a == env_b:
         raise err(400, "环境对比必须选择两个不同的环境")
     # 两个环境都得在可见范围内
@@ -281,7 +316,7 @@ def diff_config(app_id: int, env_a: str, env_b: str, user: dict = User):
 @router.get("/api/apps/{app_id}/config/versions")
 def get_versions(app_id: int, environment: str, user: dict = User):
     app_row = get_app_or_404(app_id)
-    env_checked(environment)
+    app_env_or_400(app_id, environment)
     perms.ensure_config_perm(user, app_row, environment, "view")
     return svc.list_versions(app_id, environment)
 
@@ -289,7 +324,7 @@ def get_versions(app_id: int, environment: str, user: dict = User):
 @router.get("/api/apps/{app_id}/config/versions/{version_no}")
 def get_version(app_id: int, version_no: int, environment: str, user: dict = User):
     app_row = get_app_or_404(app_id)
-    env_checked(environment)
+    app_env_or_400(app_id, environment)
     perms.ensure_config_perm(user, app_row, environment, "view")
     try:
         return svc.version_detail(app_id, environment, version_no)
@@ -300,7 +335,7 @@ def get_version(app_id: int, version_no: int, environment: str, user: dict = Use
 @router.get("/api/apps/{app_id}/config/rollback-preview")
 def rollback_preview(app_id: int, environment: str, version: int, user: dict = User):
     app_row = get_app_or_404(app_id)
-    env_checked(environment)
+    app_env_or_400(app_id, environment)
     # 预览是读操作，有查看权即可看到差异（真正回滚时再卡编辑权）
     perms.ensure_config_perm(user, app_row, environment, "view")
     try:

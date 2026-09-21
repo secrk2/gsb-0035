@@ -8,6 +8,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from . import permissions as perms
+from . import env_service as esvc
 from .auth import (
     User, ensure_bl_visible, err, get_app_checked, get_app_or_404,
     get_app_writable, is_admin, public_user,
@@ -18,6 +19,7 @@ from .db import (
 )
 from .routers import admin as admin_router
 from .routers import config as config_router
+from .routers import ops as ops_router
 from .seed import seed_if_empty
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
@@ -25,6 +27,7 @@ STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 app = FastAPI(title="织云系统", docs_url=None, redoc_url=None)
 app.include_router(config_router.router)
 app.include_router(admin_router.router)
+app.include_router(ops_router.router)
 
 
 @app.on_event("startup")
@@ -64,7 +67,7 @@ def app_to_dict(row, with_env: bool = False) -> dict:
         "owner_name": owner["name"] if owner else None,
         "cluster": row["cluster"],
         "environment": row["environment"],
-        "environment_label": ENV_LABELS[row["environment"]],
+        "environment_label": ENV_LABELS.get(row["environment"], row["environment"]),
         "status": row["status"],
         "status_label": STATUS_LABELS[row["status"]],
         "description": row["description"],
@@ -162,6 +165,39 @@ def meta(user: dict = User):
     }
 
 
+@app.get("/api/environments/catalog")
+def environments_catalog(user: dict = User, business_line_id: int | None = None):
+    """当前可见范围内出现过的全部环境（内置 + 各应用自定义），用于筛选器与标签。"""
+    sql = """SELECT DISTINCT e.env_key, e.env_label, e.is_builtin,
+                    a.business_line_id, b.name AS business_line_name
+             FROM app_environments e
+             JOIN applications a ON a.id = e.app_id
+             JOIN business_lines b ON b.id = a.business_line_id
+             WHERE 1=1"""
+    params: list = []
+    if is_admin(user):
+        if business_line_id:
+            sql += " AND a.business_line_id=?"
+            params.append(business_line_id)
+    else:
+        cond, cp = perms.scope_condition(user, "a.business_line_id", "e.env_key", "a.owner_id")
+        sql += f" AND {cond}"
+        params.extend(cp)
+        if business_line_id:
+            ensure_bl_visible(user, business_line_id)
+            sql += " AND a.business_line_id=?"
+            params.append(business_line_id)
+    rows = query(sql, tuple(params))
+    order = {k: i for i, k in enumerate(ENVIRONMENTS)}
+    merged: dict[str, dict] = {}
+    for r in rows:
+        key = r["env_key"]
+        label = ENV_LABELS.get(key, r["env_label"])
+        if key not in merged:
+            merged[key] = {"value": key, "label": label, "is_builtin": bool(r["is_builtin"])}
+    return sorted(merged.values(), key=lambda x: (order.get(x["value"], 99), x["value"]))
+
+
 @app.get("/api/business-lines")
 def business_lines(user: dict = User):
     if is_admin(user):
@@ -232,8 +268,9 @@ def list_apps(user: dict = User,
         sql += " AND owner_id = ?"
         params.append(owner_id)
     if environment:
-        if environment not in ENVIRONMENTS:
-            raise err(400, f"非法环境：{environment}，可选：{'/'.join(ENVIRONMENTS)}")
+        # 环境不再写死：内置四环境与各应用自定义环境键都可筛选
+        if not __import__("re").fullmatch(r"[a-z0-9_-]{1,32}", environment):
+            raise err(400, f"非法环境：{environment}")
         sql += " AND environment = ?"
         params.append(environment)
     if status:
@@ -278,6 +315,8 @@ def create_app(body: AppCreateIn, user: dict = User):
          body.environment, body.description.strip(), now, now),
     )
     log_change(cur.lastrowid, user["id"], "创建应用", f"应用「{body.name.strip()}」创建，初始状态：在研")
+    # 环境改为每应用注册表：新建即开通四个标准环境（窗口默认值见 DEFAULT_WINDOWS）
+    esvc.ensure_default_environments(cur.lastrowid, now)
     return app_to_dict(get_app_or_404(cur.lastrowid), with_env=True)
 
 
@@ -339,10 +378,15 @@ def update_app(app_id: int, body: AppUpdateIn, user: dict = User):
             raise err(400, f"非法集群：{body.cluster}")
         changes.append(("cluster", body.cluster, f"集群变更：{app_row['cluster']} → {body.cluster}"))
     if body.environment is not None and body.environment != app_row["environment"]:
-        if body.environment not in ENVIRONMENTS:
-            raise err(400, f"非法环境：{body.environment}")
+        # 主环境必须是该应用下已注册的环境（四个标准环境或业务线自建环境）
+        env_row = query_one(
+            "SELECT env_key, env_label FROM app_environments WHERE app_id=? AND env_key=?",
+            (app_id, body.environment),
+        )
+        if not env_row:
+            raise err(400, f"该应用下不存在环境「{body.environment}」，请先在环境管理中新增")
         changes.append(("environment", body.environment,
-                        f"环境变更：{ENV_LABELS[app_row['environment']]} → {ENV_LABELS[body.environment]}"))
+                        f"环境变更：{ENV_LABELS.get(app_row['environment'], app_row['environment'])} → {env_row['env_label']}"))
     if body.description is not None and body.description.strip() != app_row["description"]:
         changes.append(("description", body.description.strip(), "更新应用描述"))
     for field, value, _log in changes:
@@ -460,6 +504,7 @@ def console_summary(user: dict = User):
     return {
         "by_business_line": [dict(r) for r in by_bl],
         "recent_changed_apps": [dict(r) for r in recent],
+        "health_alerts": esvc.console_alerts(user),
         "red_dots": {
             "missing_owner": missing_owner,
             "missing_env": missing_env,

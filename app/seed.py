@@ -12,7 +12,8 @@
 import json
 import time
 
-from .db import STATUS_LABELS, execute, query_one
+from . import env_service as esvc
+from .db import ENV_LABELS, STATUS_LABELS, execute, query_one
 
 DAY = 86400
 
@@ -165,9 +166,12 @@ def seed_if_empty() -> bool:
                 (app_id, user_ids.get(owner) or user_ids["admin"], "状态变更",
                  f"状态流转至「{STATUS_LABELS[status]}」", now - days_ago * DAY),
             )
+        # 每个应用注册四个标准环境（开发/测试/预发/生产），窗口取环境类型默认值
+        esvc.ensure_default_environments(app_id, created)
 
     seed_config_profiles(app_ids, user_ids, now)
     seed_transfers(app_ids, user_ids, bl_ids, now)
+    seed_environments_and_health(app_ids, user_ids, now)
     return True
 
 
@@ -357,6 +361,181 @@ def seed_config_profiles(app_ids: dict, user_ids: dict, now: int) -> None:
                  "线上支付失败率升高，排查数据库连接鉴权问题，工单 INC-20260918-07",
                  now - DAY),
             )
+
+
+def seed_environments_and_health(app_ids: dict, user_ids: dict, now: int) -> None:
+    """环境发布窗口 + 实例健康演示数据。
+
+    - 支付网关·生产：一个实例昨天掉线（作战台红色告警）；国庆封网；窗口被调整过；
+    - 消息推送中心·生产：一个实例近 24h 重启 6 次（频繁重启，红色，区别于正常重启）；
+    - 风控实时引擎·生产：一个实例近 7 天重启 8 次但 24h 内仅 1 次（重启偏多，黄色）；
+    - 会员中心：新建自定义「灰度」环境（全时段），生产实例健康、仅半个月前重启过一次；
+    - 实时数仓：一个实例曾掉线后恢复。
+    所有窗口调整 / 封网 / 掉线 / 重启 / 恢复均同步写 ops_audit_logs。
+    """
+    HOUR = 3600
+
+    def env_id(app_name, key):
+        return query_one(
+            "SELECT id FROM app_environments WHERE app_id=? AND env_key=?",
+            (app_ids[app_name], key),
+        )["id"]
+
+    def set_window(app_name, key, restricted, days, start, end):
+        eid = env_id(app_name, key)
+        execute(
+            "UPDATE app_environments SET deploy_restricted=?, window_days=?, window_start=?, window_end=?, updated_at=? WHERE id=?",
+            (1 if restricted else 0, json.dumps(days), start, end, now, eid),
+        )
+        return eid
+
+    def opslog(app_name, env_key, env_label, category, target, detail, actor, ts):
+        execute(
+            """INSERT INTO ops_audit_logs
+               (app_id, environment, environment_label, category, target_name, detail, actor_id, created_at)
+               VALUES (?,?,?,?,?,?,?,?)""",
+            (app_ids[app_name], env_key, env_label, category, target, detail,
+             user_ids.get(actor), ts),
+        )
+
+    def holiday(app_name, key, date, reason, actor, days_ago):
+        eid = env_id(app_name, key)
+        execute(
+            "INSERT INTO env_holidays (env_id, app_id, holiday_date, reason, created_by, created_at) VALUES (?,?,?,?,?,?)",
+            (eid, app_ids[app_name], date, reason, user_ids[actor], now - days_ago * DAY),
+        )
+
+    def instance(app_name, key, name, status, restart_count,
+                 last_restart_at, last_seen_at, created_hours_ago):
+        eid = env_id(app_name, key)
+        aid = app_ids[app_name]
+        created = now - created_hours_ago * HOUR
+        execute(
+            """INSERT INTO app_instances
+               (app_id, env_id, environment, name, status, restart_count,
+                last_restart_at, last_seen_at, created_at, updated_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            (aid, eid, key, name, status, restart_count, last_restart_at,
+             last_seen_at, created, last_seen_at),
+        )
+        return query_one("SELECT id FROM app_instances WHERE app_id=? AND env_id=? AND name=?",
+                         (aid, eid, name))["id"]
+
+    def event(app_name, key, inst_id, etype, detail, actor, hours_ago):
+        eid = env_id(app_name, key)
+        ts = now - hours_ago * HOUR
+        execute(
+            """INSERT INTO instance_events
+               (instance_id, app_id, env_id, environment, event_type, detail, actor_id, created_at)
+               VALUES (?,?,?,?,?,?,?,?)""",
+            (inst_id, app_ids[app_name], eid, key, etype, detail,
+             user_ids.get(actor), ts),
+        )
+        return ts
+
+    # ---- 发布窗口调整 + 国庆封网（支付网关·生产）----
+    set_window("支付网关", "prod", 1, [1, 3], "10:00", "18:00")  # 周二、周四
+    opslog("支付网关", "prod", "生产", "window_update", "生产",
+           "发布窗口调整：每周 周一、周三、周五 10:00–19:00 → 每周 周二、周四 10:00–18:00",
+           "zhangwei", now - 3 * DAY)
+    holiday("支付网关", "prod", "2026-10-01", "国庆节封网（10/1–10/7 不发布）", "admin", 5)
+    holiday("支付网关", "prod", "2026-10-02", "国庆节封网", "admin", 5)
+    opslog("支付网关", "prod", "生产", "holiday_add", "2026-10-01",
+           "新增封网日 2026-10-01（国庆节封网（10/1–10/7 不发布），当天关闭发布）",
+           "admin", now - 5 * DAY)
+
+    # ---- 支付网关·生产：3 实例，1 掉线 ----
+    i1 = instance("支付网关", "prod", "pay-gw-7d9c4-2c8q9", "alive", 1,
+                  now - 9 * DAY, now - 2 * HOUR, 24 * 40)
+    event("支付网关", "prod", i1, "restart", "版本 v3 滚动发布重启", "zhangwei", 9 * 24)
+    i2 = instance("支付网关", "prod", "pay-gw-7d9c4-7k2mz", "alive", 1,
+                  now - 9 * DAY, now - 2 * HOUR, 24 * 40)
+    event("支付网关", "prod", i2, "restart", "版本 v3 滚动发布重启", "zhangwei", 9 * 24)
+    offline_ts = now - 19 * HOUR  # 昨天夜间掉线
+    i3 = instance("支付网关", "prod", "pay-gw-7d9c4-x4vbn", "offline", 2,
+                  now - 2 * DAY, offline_ts, 24 * 38)
+    event("支付网关", "prod", i3, "restart", "节点健康检查失败后自愈重启", None, 2 * 24)
+    event("支付网关", "prod", i3, "restart", "版本 v3 滚动发布重启", "zhangwei", 9 * 24)
+    event("支付网关", "prod", i3, "offline", "心跳连续 3 次超时（约 15 分钟），监控判定掉线", None, 19)
+    opslog("支付网关", "prod", "生产", "instance_offline", "pay-gw-7d9c4-x4vbn",
+           "实例 pay-gw-7d9c4-x4vbn 掉线（最后存活 22:40）", None, offline_ts)
+
+    # ---- 消息推送中心·生产：频繁重启（近 24h 6 次，红色）----
+    restart_hours = [22, 16, 11, 7, 4, 1]
+    mp = instance("消息推送中心", "prod", "msg-push-5b8f1-r8d2k", "alive",
+                  len(restart_hours), now - restart_hours[-1] * HOUR, now - 20 * 60,
+                  24 * 30)
+    for idx, h in enumerate(restart_hours):
+        ts = event("消息推送中心", "prod", mp, "restart",
+                   "进程 OOM 退出后被拉起（监控记录，非发布）", None, h)
+        if idx == len(restart_hours) - 1:
+            opslog("消息推送中心", "prod", "生产", "instance_restart",
+                   "msg-push-5b8f1-r8d2k",
+                   f"实例 msg-push-5b8f1-r8d2k 第 {idx + 1} 次重启（近 24 小时内第 6 次）", None, ts)
+    # 同环境另两个健康实例作对照
+    mp2 = instance("消息推送中心", "prod", "msg-push-5b8f1-t6n3q", "alive", 1,
+                   now - 12 * DAY, now - 3 * 60, 24 * 30)
+    event("消息推送中心", "prod", mp2, "restart", "例行补丁重启", "wangqiang", 12 * 24)
+    instance("消息推送中心", "prod", "msg-push-5b8f1-w9g7p", "alive", 1,
+             now - 12 * DAY, now - 5 * 60, 24 * 30)
+
+    # ---- 风控实时引擎·生产：近 7 天 8 次、24h 内 1 次（重启偏多，黄色）----
+    rc_hours = [6 * 24 + 2, 5 * 24, 4 * 24 + 6, 3 * 24, 2 * 24 + 3, 36, 30, 26]
+    rc = instance("风控实时引擎", "prod", "risk-rt-9c3a8-h5j6m", "alive",
+                  len(rc_hours), now - rc_hours[-1] * HOUR, now - 40 * 60, 24 * 60)
+    for h in rc_hours:
+        event("风控实时引擎", "prod", rc, "restart", "规则引擎分片重平衡触发重启", None, h)
+    instance("风控实时引擎", "prod", "risk-rt-9c3a8-q1z8x", "alive", 0,
+             None, now - 30 * 60, 24 * 60)
+
+    # ---- 会员中心：自定义「灰度」环境 ----
+    gray_eid = query_one(
+        "SELECT id FROM app_environments WHERE app_id=? AND env_key='gray'",
+        (app_ids["会员中心"],),
+    )
+    if not gray_eid:
+        execute(
+            """INSERT INTO app_environments
+               (app_id, env_key, env_label, is_builtin, deploy_restricted,
+                window_days, window_start, window_end, created_by, created_at, updated_at)
+               VALUES (?,?,?,0,0,'[]','00:00','23:59',?,?,?)""",
+            (app_ids["会员中心"], "gray", "灰度", user_ids["wangqiang"], now - 2 * DAY, now - 2 * DAY),
+        )
+        opslog("会员中心", "gray", "灰度", "env_create", "灰度",
+               "新增自定义环境「灰度」（标识 gray），默认全时段允许发布",
+               "wangqiang", now - 2 * DAY)
+        g1 = instance("会员中心", "gray", "member-gray-2f7d1-v3c5r", "alive", 0,
+                      None, now - 10 * 60, 24 * 2)
+    # 会员中心·生产：健康实例，最近一次重启在半个月前（正常重启对照）
+    mb1 = instance("会员中心", "prod", "member-c-4e6b9-m8k2s", "alive", 1,
+                   now - 15 * DAY, now - 5 * 60, 24 * 70)
+    event("会员中心", "prod", mb1, "restart", "会员等级规则季度更新发布", "wangqiang", 15 * 24)
+    instance("会员中心", "prod", "member-c-4e6b9-n4w7y", "alive", 0,
+             None, now - 7 * 60, 24 * 70)
+    instance("会员中心", "prod", "member-c-4e6b9-p0d9f", "alive", 0,
+             None, now - 9 * 60, 24 * 70)
+
+    # ---- 实时数仓·生产：曾掉线后恢复 ----
+    dw1 = instance("实时数仓", "prod", "rt-dw-8a2c5-k6m4t", "alive", 1,
+                   now - 4 * DAY, now - 60 * 60, 24 * 25)
+    event("实时数仓", "prod", dw1, "offline", "TaskManager 失联", None, 4 * 24 + 2)
+    event("实时数仓", "prod", dw1, "recover", "节点拉起，作业从 checkpoint 恢复", "sunlei", 4 * 24)
+    event("实时数仓", "prod", dw1, "restart", "恢复后随作业重启", "sunlei", 4 * 24)
+    opslog("实时数仓", "prod", "生产", "instance_offline", "rt-dw-8a2c5-k6m4t",
+           "实例 rt-dw-8a2c5-k6m4t 掉线", None, now - (4 * 24 + 2) * HOUR)
+    opslog("实时数仓", "prod", "生产", "instance_recover", "rt-dw-8a2c5-k6m4t",
+           "实例 rt-dw-8a2c5-k6m4t 恢复存活", "sunlei", now - 4 * DAY)
+    instance("实时数仓", "prod", "rt-dw-8a2c5-j7b3n", "alive", 0,
+             None, now - 2 * 60, 24 * 25)
+
+    # ---- 清结算 / 库存中台：普通健康实例，让大多数环境显示正常 ----
+    for app_name, prefix, key in [
+        ("清结算中心", "settle", "prod"),
+        ("库存中台", "stock", "prod"),
+        ("订单履约中心", "fulfill", "prod"),
+    ]:
+        instance(app_name, key, f"{prefix}-a1b2c-node1", "alive", 0, None, now - 60, 24 * 20)
+        instance(app_name, key, f"{prefix}-a1b2c-node2", "alive", 0, None, now - 90, 24 * 20)
 
 
 def seed_transfers(app_ids: dict, user_ids: dict, bl_ids: dict, now: int) -> None:

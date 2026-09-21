@@ -43,7 +43,13 @@ class TransferIn(BaseModel):
 # ---------------------------------------------------------------- 辅助
 
 def _env_label(env: str) -> str:
-    return "全部环境" if env == ENV_SCOPE_ALL else ENV_LABELS[env]
+    if env == ENV_SCOPE_ALL:
+        return "全部环境"
+    # 自定义环境键：展示名取该业务线任一应用注册表里的名字，取不到回退键本身
+    label = ENV_LABELS.get(env)
+    if label:
+        return label
+    return env
 
 
 def _grant_row_to_dict(r) -> dict:
@@ -168,8 +174,23 @@ def change_user_role(user_id: int, body: RoleIn, actor: dict = User):
 def _validate_grant_target(actor: dict, target: dict, bl_id: int, env: str) -> None:
     if not query_one("SELECT id FROM business_lines WHERE id = ?", (bl_id,)):
         raise err(400, f"业务线 #{bl_id} 不存在")
-    if env != ENV_SCOPE_ALL and env not in ENV_LABELS:
-        raise err(400, f"非法环境：{env}")
+    if env == ENV_SCOPE_ALL:
+        pass
+    elif env in ENV_LABELS:
+        pass
+    else:
+        # 自定义环境：允许对该业务线下应用已注册的自定义环境授权
+        import re as _re
+        if not _re.fullmatch(r"[a-z0-9_-]{1,32}", env or ""):
+            raise err(400, f"非法环境：{env}")
+        row = query_one(
+            """SELECT e.env_label FROM app_environments e
+               JOIN applications a ON a.id=e.app_id
+               WHERE a.business_line_id=? AND e.env_key=? LIMIT 1""",
+            (bl_id, env),
+        )
+        if not row:
+            raise err(400, f"业务线下没有任何应用注册环境「{env}」，请确认环境标识")
     # 业务线负责人只能给本业务线授权
     perms.ensure_can_manage_bl(actor, bl_id)
 

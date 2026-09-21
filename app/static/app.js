@@ -8,9 +8,11 @@ const state = {
   businessLines: [],
   users: [],
   configMeta: null,
+  envCatalog: [],
   filters: { business_line_id: "", owner_id: "", environment: "", status: "", q: "" },
   configFilters: { app_id: "", environment: "" },
   auditFilters: { app_id: "", business_line_id: "", environment: "", action: "", start: "", end: "" },
+  opsFilters: { app_id: "", business_line_id: "", environment: "", category: "", start: "", end: "" },
 };
 
 /* ---------------- 工具 ---------------- */
@@ -76,6 +78,34 @@ function statusBadge(app) {
   return `<span class="badge ${esc(app.status)}">${esc(app.status_label)}</span>`;
 }
 
+function envLabel(key) {
+  const e = (state.envCatalog || []).find((x) => x.value === key);
+  if (e) return e.label;
+  const m = (state.meta && state.meta.environments || []).find((x) => x.value === key);
+  return m ? m.label : key;
+}
+
+function envTagHtml(key, label) {
+  return `<span class="env-tag ${key === "prod" ? "prod" : ""}">${esc(label || envLabel(key))}</span>`;
+}
+
+function paintWindowBar(w, canEdit) {
+  if (!w) return "";
+  if (!w.restricted) {
+    return `<div class="window-bar open"><span>🟢 全时段允许发布</span><span class="wb-detail">该环境未限制发布时间</span></div>`;
+  }
+  if (w.allowed) {
+    return `<div class="window-bar open">
+      <span>🟢 发布窗口开放中</span>
+      <span class="wb-detail">${esc(w.window_text)}${w.next_close_at ? ` · 今天 ${fmtClock(w.next_close_at)} 关闭` : ""}</span>
+    </div>`;
+  }
+  return `<div class="window-bar closed">
+    <span>🚫 ${esc(w.message)}</span>
+    ${w.next_open_label ? `<span class="wb-next">下次可发布：${esc(w.next_open_label)}</span>` : ""}
+  </div>`;
+}
+
 function envTag(app) {
   return `<span class="env-tag ${esc(app.environment)}">${esc(app.environment_label)}</span>`;
 }
@@ -136,13 +166,15 @@ function logout(showTip = true) {
 async function bootstrap() {
   try {
     if (!state.user) state.user = await api("/api/me");
-    const [meta, bls, usrs, cfgMeta] = await Promise.all([
-      api("/api/meta"), api("/api/business-lines"), api("/api/users"), api("/api/config/meta"),
+    const [meta, bls, usrs, cfgMeta, catalog] = await Promise.all([
+      api("/api/meta"), api("/api/business-lines"), api("/api/users"),
+      api("/api/config/meta"), api("/api/environments/catalog"),
     ]);
     state.meta = meta;
     state.businessLines = bls;
     state.users = usrs;
     state.configMeta = cfgMeta;
+    state.envCatalog = catalog;
   } catch (e) {
     if (e.status !== 401) toast(e.message, "error");
     return;
@@ -173,7 +205,10 @@ function route() {
   $$("#topnav a").forEach((a) => a.classList.toggle("active", a.dataset.route === parts[0]));
   if (parts[0] === "apps" && parts[1]) renderAppDetail(parts[1]);
   else if (parts[0] === "apps") renderApps();
-  else if (parts[0] === "config") {
+  else if (parts[0] === "health") {
+    if (parts[1]) renderAppHealth(parts[1], parts[2] || "");
+    else renderHealthBoard();
+  } else if (parts[0] === "config") {
     if (parts[1]) renderConfigProfile(parts[1], parts[2] || "");
     else renderConfigList();
   } else if (parts[0] === "audit") renderAudit();
@@ -195,6 +230,7 @@ async function renderConsole() {
     return;
   }
   const t = data.totals;
+  const ha = data.health_alerts || { offline_instances: [], restart_envs: [], totals: {} };
   const maxTotal = Math.max(1, ...data.by_business_line.map((b) => b.total));
 
   view.innerHTML = `
@@ -210,6 +246,43 @@ async function renderConsole() {
       <div class="panel stat-card"><div class="num">${t.business_lines}</div><div class="label">业务线</div></div>
       <div class="panel stat-card"><div class="num">${t.recent_changed}</div><div class="label">近 7 天有变更</div></div>
       <div class="panel stat-card"><div class="num ${t.red_dot_apps ? "red" : ""}">${t.red_dot_apps}</div><div class="label">红点待处理应用</div></div>
+    </div>
+
+    <div class="panel panel-pad alert-panel" style="margin-bottom:16px">
+      <h3>🚨 实例健康告警
+        <span style="font-weight:400;font-size:12px;color:var(--ink-3)">掉线实例与频繁重启环境，无需逐个应用翻找</span>
+      </h3>
+      ${ha.totals.offline_instances === 0 && ha.totals.restart_envs === 0
+        ? '<div class="empty-tip">当前可见范围内没有掉线实例与异常重启，运行平稳。</div>'
+        : `<div style="display:grid;grid-template-columns:1fr 1fr;gap:20px" id="ha-grid">
+          <div>
+            <p style="margin:0 0 6px"><span class="red-dot">实例掉线（${ha.totals.offline_instances}）</span></p>
+            <div id="ha-offline">
+              ${ha.offline_instances.length ? ha.offline_instances.map((x) => `
+                <div class="alert-item" data-app="${x.app_id}" data-env="${esc(x.environment)}">
+                  <span class="dot offline"></span>
+                  <span class="ai-target">${esc(x.instance_name)}</span>
+                  <span class="ai-meta">${esc(x.business_line_name)} · ${esc(x.app_name)} · ${esc(x.environment_label)}</span>
+                  <span class="ai-time">掉线 ${fmtAgo(x.offline_since)}</span>
+                </div>`).join("") : '<div class="empty-tip" style="padding:10px 0">无掉线实例</div>'}
+            </div>
+          </div>
+          <div>
+            <p style="margin:0 0 6px"><b style="color:var(--ink-2)">频繁/偏多重启环境（${ha.totals.restart_envs}）</b>
+              <span style="font-size:11px;color:var(--ink-3)">按近 24h / 7 天频率分级</span></p>
+            <div id="ha-restart">
+              ${ha.restart_envs.length ? ha.restart_envs.map((x) => `
+                <div class="alert-item" data-app="${x.app_id}" data-env="${esc(x.environment)}">
+                  <span class="hl ${x.level}">${esc(x.level_label)}</span>
+                  <span class="ai-target">${esc(x.app_name)} · ${esc(x.environment_label)}</span>
+                  <span class="ai-meta">${esc(x.business_line_name)}</span>
+                  <span class="ai-time">近 24h
+                    <span class="${x.level === "critical" ? "restart-badge-crit" : "restart-badge-warn"}">${x.restarts_24h} 次</span>
+                    ${x.last_restart_at ? `· 最近 ${fmtAgo(x.last_restart_at)}` : ""}</span>
+                </div>`).join("") : '<div class="empty-tip" style="padding:10px 0">无异常重启环境</div>'}
+            </div>
+          </div>
+        </div>`}
     </div>
 
     <div class="dash-grid">
@@ -270,6 +343,9 @@ async function renderConsole() {
   $$("[data-app-id]", view).forEach((el) => {
     el.onclick = () => { location.hash = `#/apps/${el.dataset.appId}`; };
   });
+  $$("#ha-grid [data-app]", view).forEach((el) => {
+    el.onclick = () => { location.hash = `#/health/${el.dataset.app}/${el.dataset.env}`; };
+  });
 }
 
 /* ---------------- 应用台账 ---------------- */
@@ -304,7 +380,7 @@ async function renderApps() {
       </select>
       <select id="f-env">
         <option value="">全部环境</option>
-        ${state.meta.environments.map((e) => `<option value="${e.value}" ${f.environment === e.value ? "selected" : ""}>${esc(e.label)}</option>`).join("")}
+        ${state.envCatalog.map((e) => `<option value="${e.value}" ${f.environment === e.value ? "selected" : ""}>${esc(e.label)}</option>`).join("")}
       </select>
       <select id="f-status">
         <option value="">全部状态</option>
@@ -435,6 +511,8 @@ async function renderAppDetail(appId) {
       </div>
       <div style="display:flex;gap:8px">
         <button class="btn" id="btn-back">← 返回台账</button>
+        <button class="btn" id="btn-health">应用健康</button>
+        ${canManage && !isOffline ? '<button class="btn" id="btn-env-mgr">环境与窗口</button>' : ""}
         <button class="btn" id="btn-config">配置档案</button>
         ${canTransfer ? '<button class="btn" id="btn-transfer">应用交接</button>' : ""}
         ${canManage && !isOffline ? '<button class="btn" id="btn-edit">编辑信息</button>' : ""}
@@ -519,6 +597,9 @@ async function renderAppDetail(appId) {
     </div>`;
 
   $("#btn-back").onclick = () => { location.hash = "#/apps"; };
+  $("#btn-health").onclick = () => { location.hash = `#/health/${app.id}`; };
+  const envMgrBtn = $("#btn-env-mgr");
+  if (envMgrBtn) envMgrBtn.onclick = () => openEnvManagerModal(app);
   $("#btn-config").onclick = () => { location.hash = `#/config/${app.id}/${app.environment}`; };
   const transferBtn = $("#btn-transfer");
   if (transferBtn) transferBtn.onclick = () => openTransferModal(app);
@@ -632,9 +713,11 @@ function openAppModal(app) {
           </div>
           <div>
             <label>环境 *</label>
-            <select id="m-env">
-              ${state.meta.environments.map((e) => `<option value="${e.value}" ${isEdit && app.environment === e.value ? "selected" : ""}>${esc(e.label)}</option>`).join("")}
+            <select id="m-env" ${isEdit ? "" : ""}>
+              ${(isEdit ? [] : state.meta.environments).map((e) => `<option value="${e.value}">${esc(e.label)}</option>`).join("")}
+              ${isEdit ? `<option value="${esc(app.environment)}">${esc(app.environment_label)}</option>` : ""}
             </select>
+            ${isEdit ? '<div class="field-hint">可选环境以本应用已注册的为准；新增环境请到「环境与窗口」</div>' : '<div class="field-hint">新建后自动开通开发/测试/预发/生产四个环境</div>'}
           </div>
           <div class="full">
             <label>描述</label>
@@ -656,6 +739,16 @@ function openAppModal(app) {
   const blSel = $("#m-bl");
   if (!isEdit) {
     blSel.onchange = () => { $("#m-owner").innerHTML = `<option value="">（暂不指定）</option>` + ownerOptions(blSel.value); };
+  }
+  if (isEdit) {
+    // 编辑时主环境可选范围 = 本应用已注册环境（含自定义环境）
+    api(`/api/apps/${app.id}/environments`).then((envs) => {
+      const sel = $("#m-env");
+      if (!sel) return;
+      sel.innerHTML = envs.map((e) =>
+        `<option value="${esc(e.env_key)}" ${e.env_key === app.environment ? "selected" : ""}>${esc(e.env_label)}${e.is_builtin ? "" : "（自定义）"}</option>`
+      ).join("");
+    }).catch(() => {});
   }
 
   $("#m-submit").onclick = async () => {
@@ -735,7 +828,7 @@ async function renderConfigList() {
       </select>
       <select id="cf-env">
         <option value="">全部环境</option>
-        ${state.meta.environments.map((e) => `<option value="${e.value}" ${f.environment === e.value ? "selected" : ""}>${esc(e.label)}</option>`).join("")}
+        ${state.envCatalog.map((e) => `<option value="${e.value}" ${f.environment === e.value ? "selected" : ""}>${esc(e.label)}</option>`).join("")}
       </select>
       <button class="btn" id="cf-reset">重置</button>
     </div>
@@ -762,7 +855,7 @@ async function renderConfigList() {
                   <td class="app-name-cell">${esc(r.app_name)}
                     ${r.app_status === "offline" ? '<span class="badge offline">已下线</span>' : ""}</td>
                   <td>${esc(r.business_line_name)}</td>
-                  <td><span class="env-tag ${esc(r.environment)}">${esc(state.meta.environments.find((e) => e.value === r.environment).label)}</span></td>
+                  <td><span class="env-tag ${esc(r.environment)}">${esc(envLabel(r.environment))}</span></td>
                   <td>${r.item_count} 项</td>
                   <td>${r.secret_count ? `<span class="secret-chip">🔒 ${r.secret_count}</span>` : '<span style="color:var(--ink-3)">—</span>'}</td>
                   <td><b>v${r.latest_version}</b>${r.latest_note ? `<div class="app-desc">${esc(r.latest_note)}</div>` : ""}</td>
@@ -813,7 +906,11 @@ async function paintConfigProfile(appId, environment) {
     view.innerHTML = errorStateHtml(e.status === 403 ? "403 无权访问" : e.status === 404 ? "404 不存在" : "加载失败", e.message);
     return;
   }
-  const envTabs = state.meta.environments;
+  // 环境标签来自该应用已注册的环境（含自定义），不再用写死四枚举
+  const envTabs = (data.env_permissions || []).map((m) => ({
+    value: m.environment,
+    label: m.environment_label || envLabel(m.environment),
+  }));
   const permsEnv = {};
   (data.env_permissions || []).forEach((m) => { permsEnv[m.environment] = m; });
   const curPerm = data.permissions || { can_edit: false, can_reveal: false };
@@ -838,12 +935,14 @@ async function paintConfigProfile(appId, environment) {
         if (denied) {
           return `<span class="env-tab disabled ${e.value === "prod" ? "prod" : ""}"
              title="${esc(m.view_deny_reason || "该环境不在你的可见范围内")}"
-             data-deny-env="${e.label}">${esc(e.label)} 🔒</span>`;
+             data-deny-env="${esc(e.environment_label || e.label)}">${esc(e.environment_label || e.label)} 🔒</span>`;
         }
         return `<a class="env-tab ${e.value === environment ? "active" : ""} ${e.value === "prod" ? "prod" : ""}"
-         href="#/config/${appId}/${e.value}">${esc(e.label)}</a>`;
+         href="#/config/${appId}/${e.value}">${esc(e.environment_label || e.label)}</a>`;
       }).join("")}
     </div>
+
+    ${data.window ? paintWindowBar(data.window, canEdit) : ""}
 
     ${data.read_only
       ? '<div class="panel panel-pad perm-notice">应用已下线（终态），配置档案只读，不能编辑或回滚。</div>'
@@ -879,8 +978,10 @@ async function paintConfigProfile(appId, environment) {
   $("#cp-app").onclick = () => { location.hash = `#/apps/${appId}`; };
   const diffBtn = $("#cp-diff-btn");
   diffBtn.onclick = () => {
-    const visibleEnvs = (data.env_permissions || []).filter((m) => m.visible).map((m) => m.environment);
-    openEnvDiffModal(appId, environment, visibleEnvs);
+    const visibleEnvObjs = (data.env_permissions || [])
+      .filter((m) => m.visible)
+      .map((m) => ({ environment: m.environment, environment_label: m.environment_label || envLabel(m.environment) }));
+    openEnvDiffModal(appId, environment, visibleEnvObjs);
   };
   const editBtn = $("#cp-edit-btn");
   if (editBtn) editBtn.onclick = () => openConfigEditor(appId, environment, data);
@@ -1043,7 +1144,7 @@ function openConfigEditor(appId, environment, data, prefill) {
   root.innerHTML = `
     <div class="modal-mask">
       <div class="modal" style="width:880px">
-        <h3>编辑配置 · ${esc(data.app_name)} · ${esc(state.meta.environments.find((e) => e.value === environment).label)}环境
+        <h3>编辑配置 · ${esc(data.app_name)} · ${esc(envLabel(environment))}环境
           <span class="ver-base">基线 v${data.current_version}</span></h3>
         ${conflictKeys.size ? `<div class="conflict-hint">以下键双方都改过，当前保留的是服务器最新值，请逐项确认（标红行）：${esc([...conflictKeys].join("、"))}</div>` : ""}
         <p style="color:var(--ink-3);font-size:12px;margin:0 0 10px">整体保存后生成一个新版本；密文值留空表示「不修改原密文」。保存会再次校验版本，防止并发覆盖。</p>
@@ -1148,6 +1249,11 @@ function openConfigEditor(appId, environment, data, prefill) {
       toast(`已生成 v${res.version}，${res.changes} 个键发生变化`, "success");
       paintConfigProfile(appId, environment);
     } catch (e) {
+      if (e.status === 409 && e.payload && e.payload.code === "deploy_window_closed") {
+        // 发布窗口外拦截：明确告知原因与下次开放时间，而不是只给一个灰按钮
+        openWindowBlockedModal(e.payload);
+        return;
+      }
       if (e.status === 409 && e.payload) {
         // 并发冲突：弹出差异让用户取舍，而不是静默覆盖
         openConfigConflictModal(appId, environment, e.payload, { items, note: $("#ce-note").value.trim() }, close);
@@ -1159,10 +1265,26 @@ function openConfigEditor(appId, environment, data, prefill) {
   };
 }
 
+function openWindowBlockedModal(p) {
+  const root = $("#modal-root");
+  root.insertAdjacentHTML("beforeend", `
+    <div class="modal-mask" id="wb-mask"><div class="modal" style="width:520px">
+      <h3>🚫 当前不在发布窗口</h3>
+      <p style="color:var(--ink-2);font-size:13px;line-height:1.7">${esc(p.message)}</p>
+      <div class="window-bar closed" style="margin:8px 0 4px">
+        <span>窗口规则：${esc(p.window_text)}</span>
+      </div>
+      ${p.next_open_label ? `<p style="font-size:15px;margin:12px 0">下一次能发布：<b style="color:#a02a2e">${esc(p.next_open_label)}</b></p>` : ""}
+      <p style="color:var(--ink-3);font-size:12px;margin:0">本次保存已被服务端拒绝并记录到变更留痕；如需紧急发布，请联系有权限者调整窗口或解除当天封网。</p>
+      <div class="form-actions"><button class="btn primary" id="wb-ok">我知道了</button></div>
+    </div></div>`);
+  $("#wb-ok").onclick = () => $("#wb-mask").remove();
+  $("#wb-mask").onclick = (ev) => { if (ev.target.id === "wb-mask") $("#wb-mask").remove(); };
+}
+
 /* ---------------- 并发编辑冲突（乐观锁 409） ---------------- */
 function openConfigConflictModal(appId, environment, p, draft, closeEditor) {
   const root = $("#modal-root");
-  const envLabel = state.meta.environments.find((e) => e.value === environment).label;
   const interesting = (p.entries || []).filter((e) => e.status !== "same");
   const meta = p.current_version_meta || {};
   root.innerHTML = `
@@ -1326,6 +1448,11 @@ async function openRollbackModal(appId, environment, targetVersion) {
       toast(`已回滚：生成 v${res.version}，${res.changes} 个键变化；历史留痕已保留`, "success");
       paintConfigProfile(appId, environment);
     } catch (e) {
+      if (e.status === 409 && e.payload && e.payload.code === "deploy_window_closed") {
+        close();
+        openWindowBlockedModal(e.payload);
+        return;
+      }
       if (e.status === 409 && e.payload) {
         // 回滚前又有人保存了新版本：同样不能静默覆盖，弹冲突提示并刷新
         close();
@@ -1346,26 +1473,26 @@ function diffArrow(status) {
 }
 
 /* ---------------- 环境对比 ---------------- */
-function openEnvDiffModal(appId, curEnv, visibleEnvList) {
+function openEnvDiffModal(appId, curEnv, visibleEnvObjs) {
   const root = $("#modal-root");
-  const all = state.meta.environments;
-  const visSet = new Set(visibleEnvList && visibleEnvList.length
-    ? visibleEnvList : all.map((e) => e.value));
-  const visibleEnvs = all.filter((e) => visSet.has(e.value));
-  const otherEnvs = visibleEnvs.filter((e) => e.value !== curEnv);
+  // visibleEnvObjs：该应用已注册且当前账号可见的环境 {environment, environment_label}
+  const all = visibleEnvObjs && visibleEnvObjs.length ? visibleEnvObjs : [];
+  const visibleEnvs = all;
+  const otherEnvs = visibleEnvs.filter((e) => e.environment !== curEnv);
+  const curName = (all.find((e) => e.environment === curEnv) || {}).environment_label || envLabel(curEnv);
   root.innerHTML = `
     <div class="modal-mask">
       <div class="modal" style="width:860px">
         <h3>环境配置差异对比</h3>
-        ${visibleEnvs.length < 2 ? `<p style="color:var(--red);font-size:13px">你只有一个环境（${esc(all.find((e)=>e.value===curEnv)?.label || curEnv)}）的可见权，无法做环境对比；其他环境需另行授权。</p>` : ""}
+        ${visibleEnvs.length < 2 ? `<p style="color:var(--red);font-size:13px">你只有一个环境（${esc(curName)}）的可见权，无法做环境对比；其他环境需另行授权。</p>` : ""}
         <div class="filter-bar" style="padding:0 0 12px;box-shadow:none;border:0">
           <span style="font-size:13px;color:var(--ink-2)">基准环境</span>
           <select id="df-a">
-            ${visibleEnvs.map((e) => `<option value="${e.value}" ${e.value === curEnv ? "selected" : ""}>${esc(e.label)}</option>`).join("")}
+            ${visibleEnvs.map((e) => `<option value="${e.environment}" ${e.environment === curEnv ? "selected" : ""}>${esc(e.environment_label)}</option>`).join("")}
           </select>
           <span style="font-size:13px;color:var(--ink-2)">对比环境</span>
           <select id="df-b">
-            ${otherEnvs.map((e) => `<option value="${e.value}" ${e.value === "prod" && curEnv !== "prod" ? "selected" : ""}>${esc(e.label)}</option>`).join("")}
+            ${otherEnvs.map((e) => `<option value="${e.environment}" ${e.environment === "prod" && curEnv !== "prod" ? "selected" : ""}>${esc(e.environment_label)}</option>`).join("")}
           </select>
           <button class="btn primary small" id="df-run" ${otherEnvs.length ? "" : "disabled"}>对比</button>
         </div>
@@ -1390,7 +1517,6 @@ function openEnvDiffModal(appId, curEnv, visibleEnvList) {
 }
 
 function paintDiffResult(d) {
-  const envLabel = (v) => state.meta.environments.find((e) => e.value === v).label;
   const s = d.summary;
   const interesting = d.entries.filter((e) => e.status !== "same");
   const box = $("#df-result");
@@ -1417,18 +1543,33 @@ function paintDiffResult(d) {
 }
 
 /* ---------------- 变更留痕 ---------------- */
+let auditTab = "config";
+
 async function renderAudit() {
   const view = $("#view");
-  const f = state.auditFilters;
-  const isAdmin = state.user.role === "admin";
   view.innerHTML = `
     <div class="page-head">
       <div>
         <h2>变更留痕</h2>
-        <div class="sub">配置的每次改动：谁改的、改前改后是什么；密文值在留痕中同样脱敏</div>
+        <div class="sub">配置逐键流水，以及发布窗口调整、节假日封网、实例掉线/重启等环境与健康变更</div>
       </div>
-      <button class="btn primary" id="au-export">导出差异清单 CSV</button>
     </div>
+    <div class="admin-tabs">
+      <button class="adm-tab ${auditTab === "config" ? "active" : ""}" data-at="config">配置留痕</button>
+      <button class="adm-tab ${auditTab === "ops" ? "active" : ""}" data-at="ops">环境与健康留痕</button>
+    </div>
+    <div id="audit-body"><div class="empty-tip">加载中…</div></div>`;
+  $$(".adm-tab", view).forEach((b) => {
+    b.onclick = () => { auditTab = b.dataset.at; renderAudit(); };
+  });
+  if (auditTab === "config") renderConfigAudit();
+  else renderOpsAudit();
+}
+
+async function renderConfigAudit() {
+  const f = state.auditFilters;
+  const isAdmin = state.user.role === "admin";
+  $("#audit-body").innerHTML = `
     <div class="panel filter-bar">
       <select id="au-bl" ${isAdmin ? "" : "disabled"}>
         <option value="">全部业务线</option>
@@ -1437,7 +1578,7 @@ async function renderAudit() {
       <input id="au-app" placeholder="应用 ID（可留空）" value="${esc(f.app_id)}" style="width:130px">
       <select id="au-env">
         <option value="">全部环境</option>
-        ${state.meta.environments.map((e) => `<option value="${e.value}" ${f.environment === e.value ? "selected" : ""}>${esc(e.label)}</option>`).join("")}
+        ${state.envCatalog.map((e) => `<option value="${e.value}" ${f.environment === e.value ? "selected" : ""}>${esc(e.label)}</option>`).join("")}
       </select>
       <select id="au-action">
         <option value="">全部动作</option>
@@ -1448,6 +1589,7 @@ async function renderAudit() {
       <input type="date" id="au-end" value="${esc(f.end)}" title="结束日期">
       <button class="btn primary" id="au-run">查询</button>
       <button class="btn" id="au-reset">重置</button>
+      <button class="btn primary" id="au-export" style="margin-left:auto">导出差异清单 CSV</button>
     </div>
     <div id="au-result"><div class="empty-tip">加载中…</div></div>`;
 
@@ -1501,6 +1643,117 @@ async function renderAudit() {
   await load();
 }
 
+async function renderOpsAudit() {
+  const f = state.opsFilters;
+  const isAdmin = state.user.role === "admin";
+  let cats = [];
+  try {
+    cats = (await api("/api/ops/audit/meta")).categories;
+  } catch (e) { /* 忽略，用兜底 */ }
+  $("#audit-body").innerHTML = `
+    <div class="panel filter-bar">
+      <select id="op-bl" ${isAdmin ? "" : "disabled"}>
+        <option value="">全部业务线</option>
+        ${state.businessLines.map((b) => `<option value="${b.id}" ${String(b.id) === String(f.business_line_id) ? "selected" : ""}>${esc(b.name)}</option>`).join("")}
+      </select>
+      <input id="op-app" placeholder="应用 ID（可留空）" value="${esc(f.app_id)}" style="width:130px">
+      <select id="op-env">
+        <option value="">全部环境</option>
+        ${state.envCatalog.map((e) => `<option value="${e.value}" ${f.environment === e.value ? "selected" : ""}>${esc(e.label)}</option>`).join("")}
+      </select>
+      <select id="op-cat">
+        <option value="">全部类别</option>
+        ${cats.map((c) => `<option value="${c.value}" ${f.category === c.value ? "selected" : ""}>${esc(c.label)}</option>`).join("")}
+      </select>
+      <input type="date" id="op-start" value="${esc(f.start)}" title="开始日期">
+      <span style="color:var(--ink-3)">至</span>
+      <input type="date" id="op-end" value="${esc(f.end)}" title="结束日期">
+      <button class="btn primary" id="op-run">查询</button>
+      <button class="btn" id="op-reset">重置</button>
+      <button class="btn primary" id="op-export" style="margin-left:auto">导出 CSV</button>
+    </div>
+    <div id="op-result"><div class="empty-tip">加载中…</div></div>`;
+
+  const buildParams = () => {
+    const p = new URLSearchParams();
+    if (isAdmin && $("#op-bl").value) p.set("business_line_id", $("#op-bl").value);
+    if ($("#op-app").value.trim()) p.set("app_id", $("#op-app").value.trim());
+    if ($("#op-env").value) p.set("environment", $("#op-env").value);
+    if ($("#op-cat").value) p.set("category", $("#op-cat").value);
+    if ($("#op-start").value) p.set("start", $("#op-start").value);
+    if ($("#op-end").value) p.set("end", $("#op-end").value);
+    return p;
+  };
+  const load = async () => {
+    try {
+      const rows = await api(`/api/ops/audit?${buildParams().toString()}`);
+      paintOpsRows(rows);
+    } catch (e) {
+      $("#op-result").innerHTML = errorStateHtml("查询失败", e.message);
+    }
+  };
+  $("#op-run").onclick = () => {
+    state.opsFilters = {
+      app_id: $("#op-app").value.trim(), business_line_id: $("#op-bl").value,
+      environment: $("#op-env").value, category: $("#op-cat").value,
+      start: $("#op-start").value, end: $("#op-end").value,
+    };
+    load();
+  };
+  $("#op-reset").onclick = () => {
+    state.opsFilters = { app_id: "", business_line_id: "", environment: "", category: "", start: "", end: "" };
+    renderAudit();
+  };
+  $("#op-export").onclick = () => {
+    fetch(`/api/ops/audit/export.csv?${buildParams().toString()}`, {
+      headers: { "X-Token": state.token },
+    }).then(async (res) => {
+      if (!res.ok) {
+        const d = await res.json().catch(() => ({}));
+        throw new Error(d.detail || `导出失败（HTTP ${res.status}）`);
+      }
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url; a.download = `ops-changelog-${Date.now()}.csv`;
+      a.click();
+      URL.revokeObjectURL(url);
+    }).catch((e) => toast(e.message, "error"));
+  };
+  await load();
+}
+
+function paintOpsRows(rows) {
+  const box = $("#op-result");
+  if (!rows.length) {
+    box.innerHTML = `<div class="panel panel-pad empty-tip">该时间窗内没有环境与健康变更记录</div>`;
+    return;
+  }
+  box.innerHTML = `
+    <div class="panel table-wrap">
+      <table class="app-table audit-table">
+        <thead><tr>
+          <th>时间</th><th>应用</th><th>环境</th><th>类别</th><th>对象</th><th>详情</th><th>操作人</th>
+        </tr></thead>
+        <tbody>
+          ${rows.map((r) => `
+            <tr>
+              <td class="nowrap">${fmtTime(r.created_at)}</td>
+              <td class="app-name-cell">${esc(r.app_name)}<div class="app-desc">${esc(r.business_line_name)}</div></td>
+              <td><span class="env-tag ${r.environment === "prod" ? "prod" : ""}">${esc(r.environment_label)}</span></td>
+              <td><span class="action-tag ${esc(r.category)}">${esc(r.category_label)}</span></td>
+              <td class="mono">${esc(r.target_name || "—")}</td>
+              <td class="reason-cell">${esc(r.detail)}</td>
+              <td class="nowrap">${esc(r.user_name)}</td>
+            </tr>`).join("")}
+        </tbody>
+      </table>
+    </div>
+    <p style="color:var(--ink-3);font-size:12px;margin:8px 2px">
+      窗口规则改动、节假日封网、实例掉线/恢复/重启、窗口外拦截上线都在此留痕，最多返回最近 500 条。
+    </p>`;
+}
+
 function paintAuditRows(rows) {
   const box = $("#au-result");
   if (!rows.length) {
@@ -1519,7 +1772,7 @@ function paintAuditRows(rows) {
             <tr>
               <td class="nowrap">${fmtTime(r.created_at)}</td>
               <td class="app-name-cell">${esc(r.app_name)}<div class="app-desc">${esc(r.business_line_name)}</div></td>
-              <td><span class="env-tag ${esc(r.environment)}">${esc(r.environment_label)}</span></td>
+              <td><span class="env-tag ${esc(r.environment)}">${esc(r.environment_label === r.environment ? envLabel(r.environment) : r.environment_label)}</span></td>
               <td><span class="action-tag ${esc(r.action)}">${esc(r.action_label)}</span>${r.is_secret ? ' <span title="涉及密文">🔒</span>' : ""}</td>
               <td class="mono">${esc(r.config_key || "—")}</td>
               <td class="mono audit-val">${r.old_value === null ? '<span class="diff-gone">—</span>' : esc(r.old_value)}</td>
@@ -1718,7 +1971,7 @@ async function openPermDetail(uid) {
         </select>
         <select id="pm-env">
           <option value="*">全部环境</option>
-          ${state.meta.environments.map((e) => `<option value="${e.value}">${esc(e.label)}</option>`).join("")}
+          ${state.envCatalog.map((e) => `<option value="${e.value}">${esc(e.label)}${e.is_builtin ? "" : "（自定义）"}</option>`).join("")}
         </select>
         <label class="chk"><input type="checkbox" id="pm-edit"> 配置编辑权</label>
         <label class="chk"><input type="checkbox" id="pm-reveal"> 密文查看权（与编辑独立）</label>
@@ -1874,6 +2127,551 @@ async function renderAdminLogs() {
       </table>
     </div>
     <p style="color:var(--ink-3);font-size:12px;margin:8px 2px">应用交接同时写入该应用的「变更记录」；配置逐键改动见「变更留痕」页。</p>`;
+}
+
+/* ---------------- 环境管理 & 发布窗口 ---------------- */
+const WEEK_NAMES = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"];
+
+async function openEnvManagerModal(app) {
+  const root = $("#modal-root");
+  root.innerHTML = `
+    <div class="modal-mask"><div class="modal" style="width:760px">
+      <h3>环境与发布窗口 · ${esc(app.name || "")}</h3>
+      <p style="color:var(--ink-2);font-size:12.5px;margin:0 0 12px">
+        开发/预发/生产不是写死的：可在本应用下新增自定义环境；每个环境单独设发布窗口（周几 × 时段）与节假日封网；
+        删除前会清点配置、版本与实例，有挂载的环境不允许删除。
+      </p>
+      <div id="em-list"><div class="empty-tip">加载环境…</div></div>
+      <div id="em-add" style="margin-top:14px"></div>
+      <div class="form-actions"><button class="btn primary" id="em-done">完成</button></div>
+    </div></div>`;
+  const close = () => { root.innerHTML = ""; };
+  $("#em-done").onclick = close;
+  $(".modal-mask", root).onclick = (e) => { if (e.target.classList.contains("modal-mask")) close(); };
+  await paintEnvList(app);
+}
+
+async function paintEnvList(app) {
+  const box = $("#em-list");
+  let envs;
+  try {
+    envs = await api(`/api/apps/${app.id}/environments`);
+  } catch (e) { box.innerHTML = `<div class="empty-tip">${esc(e.message)}</div>`; return; }
+  const canManage = envs.some((e) => e.can_manage);
+  box.innerHTML = `
+    <div class="env-grid">
+      ${envs.map((e) => {
+        const h = e.health || {};
+        return `
+        <div class="panel env-card ${h.level === "offline" ? "has-offline" : ""}">
+          <div class="ec-head">
+            <span class="ec-name">${esc(e.env_label)}</span>
+            ${e.is_primary ? '<span class="ec-primary">应用所属环境</span>' : ""}
+            ${e.is_builtin ? "" : '<span class="ec-tag">自定义</span>'}
+          </div>
+          <div class="ec-window" title="${esc(e.window_text)}">🕒 ${esc(e.window_text)}</div>
+          <div class="ec-health">
+            <span class="hl ${h.level || "empty"}">${esc(h.level_label || "—")}</span>
+            <span class="ec-nums">${h.total ? `共 ${h.total} · 活 ${h.alive} · 挂 ${h.offline}` : "未登记实例"}
+              ${h.total ? `· 24h 重启 ${h.restarts_24h}` : ""}</span>
+          </div>
+          <div class="ec-window" style="color:var(--ink-3)">
+            封网日 ${(e.holidays || []).filter((x) => !x.passed).length} 天 · 配置 ${e.usage.config_items} 项 · 实例 ${e.usage.instances} 个
+          </div>
+          <div class="ec-actions">
+            ${canManage ? `<button class="btn small" data-window="${e.id}">设置窗口 / 封网</button>` : ""}
+            <button class="btn small" data-health="${e.id}" data-env="${esc(e.env_key)}">看实例健康</button>
+            ${canManage ? (e.can_delete
+                ? `<button class="btn small danger" data-del="${e.id}">删除环境</button>`
+                : `<button class="btn small danger" disabled title="${esc((e.delete_blockers || []).join("；"))}">删除环境</button>`)
+              : ""}
+          </div>
+        </div>`;
+      }).join("")}
+    </div>`;
+
+  $$("[data-window]", box).forEach((b) => {
+    b.onclick = () => openWindowModal(app, envs.find((x) => x.id === +b.dataset.window));
+  });
+  $$("[data-health]", box).forEach((b) => {
+    b.onclick = () => { $("#modal-root").innerHTML = ""; location.hash = `#/health/${app.id}/${b.dataset.env}`; };
+  });
+  $$("[data-del]", box).forEach((b) => {
+    b.onclick = () => deleteEnv(app, envs.find((x) => x.id === +b.dataset.del));
+  });
+
+  const addBox = $("#em-add");
+  if (canManage) {
+    addBox.innerHTML = `
+      <div class="panel panel-pad" style="background:#fafbfc">
+        <b style="font-size:13px">新增自定义环境</b>
+        <div class="filter-bar" style="box-shadow:none;border:0;padding:8px 0 0">
+          <input id="em-key" placeholder="标识（小写英文，如 gray / pre-prod）" style="width:230px">
+          <input id="em-label" placeholder="名称（如 灰度 / 预演）" style="width:160px">
+          <button class="btn primary small" id="em-create">+ 新增环境</button>
+          <span style="color:var(--ink-3);font-size:12px">新环境默认全时段允许发布，可随后设置窗口</span>
+        </div>
+        <div class="form-error" id="em-err"></div>
+      </div>`;
+    $("#em-create").onclick = async () => {
+      const errBox = $("#em-err");
+      errBox.classList.remove("show");
+      try {
+        await api(`/api/apps/${app.id}/environments`, {
+          method: "POST",
+          body: { env_key: $("#em-key").value.trim(), env_label: $("#em-label").value.trim() },
+        });
+        toast("环境已新增", "success");
+        paintEnvList(app);
+      } catch (e2) { errBox.textContent = e2.message; errBox.classList.add("show"); }
+    };
+  }
+}
+
+async function deleteEnv(app, env) {
+  if (!confirm(`确认删除环境「${env.env_label}」？删除前会再次检查是否有配置/版本/实例挂载。`)) return;
+  try {
+    await api(`/api/apps/${app.id}/environments/${env.id}`, { method: "DELETE" });
+    toast(`环境「${env.env_label}」已删除`, "success");
+    paintEnvList(app);
+  } catch (e) {
+    // 有挂载：明确说出挂在哪里，而不是只让按钮置灰
+    const blockers = e.payload && e.payload.blockers ? e.payload.blockers : [e.message];
+    openDeleteBlockedModal(env, blockers);
+  }
+}
+
+function openDeleteBlockedModal(env, blockers) {
+  const root = $("#modal-root");
+  // 覆盖式弹到最上层（环境管理弹窗之上）
+  root.insertAdjacentHTML("beforeend", `
+    <div class="modal-mask" id="db-mask"><div class="modal" style="width:520px">
+      <h3>无法删除环境「${esc(env.env_label)}」</h3>
+      <p style="color:var(--ink-2);font-size:13px">该环境上还挂着资产，必须先迁移或清理后才能删除：</p>
+      <ul style="line-height:1.9;color:#a02a2e">
+        ${blockers.map((b) => `<li>${esc(b)}</li>`).join("")}
+      </ul>
+      <div class="form-actions"><button class="btn primary" id="db-ok">我知道了</button></div>
+    </div></div>`);
+  $("#db-ok").onclick = () => { $("#db-mask").remove(); };
+  $("#db-mask").onclick = (ev) => { if (ev.target.id === "db-mask") $("#db-mask").remove(); };
+}
+
+function openWindowModal(app, env, onSaved) {
+  const root = $("#modal-root");
+  let days = new Set(env.window_days || []);
+  let restricted = env.deploy_restricted;
+  let start = env.window_start || "10:00";
+  let end = env.window_end || "18:00";
+
+  root.insertAdjacentHTML("beforeend", `
+    <div class="modal-mask" id="win-mask"><div class="modal" style="width:600px">
+      <h3>发布窗口 · ${esc(env.env_label)}环境</h3>
+      <label class="chk" style="margin-bottom:10px">
+        <input type="checkbox" id="w-restrict" ${restricted ? "checked" : ""}>
+        限制发布时间（不勾选 = 全时段允许发布）
+      </label>
+      <div id="w-body">
+        <label style="font-size:12px;color:var(--ink-2)">允许发布的星期</label>
+        <div class="week-days" id="w-days" style="margin:6px 0 12px">
+          ${WEEK_NAMES.map((n, i) => `<div class="week-day ${days.has(i) ? "on" : ""}" data-d="${i}">${n}</div>`).join("")}
+        </div>
+        <label style="font-size:12px;color:var(--ink-2)">每日允许时段</label>
+        <div class="time-range" style="margin:6px 0 4px">
+          <input type="time" id="w-start" value="${esc(start)}">
+          <span>至</span>
+          <input type="time" id="w-end" value="${esc(end)}">
+        </div>
+        <p style="color:var(--ink-3);font-size:12px;margin:2px 0 0">窗口外（含非发布日）的上线会被拦下，并提示下一次开放时间；暂不支持跨午夜窗口。</p>
+      </div>
+      <div class="form-error" id="w-err"></div>
+      <div class="form-actions">
+        <button class="btn" id="w-cancel">取消</button>
+        <button class="btn primary" id="w-save">保存窗口</button>
+      </div>
+
+      <h3 style="margin-top:18px;font-size:14px">节假日封网</h3>
+      <p style="color:var(--ink-3);font-size:12px;margin:0 0 8px">命中以下日期时，即使是发布日也整天关闭发布。</p>
+      <div class="filter-bar" style="box-shadow:none;border:0;padding:0">
+        <input type="date" id="h-date">
+        <input id="h-reason" class="grow" placeholder="封网原因（如 国庆节 / 大促冻结）">
+        <button class="btn small" id="h-add">+ 新增封网日</button>
+      </div>
+      <div class="holiday-list" id="h-list"></div>
+      <div class="form-error" id="h-err"></div>
+    </div></div>`);
+  const mask = $("#win-mask");
+  const close = () => mask.remove();
+  $("#w-cancel").onclick = close;
+  mask.onclick = (ev) => { if (ev.target === mask) close(); };
+
+  function syncBody() { $("#w-body").style.opacity = restricted ? "1" : ".45"; $("#w-body").style.pointerEvents = restricted ? "auto" : "none"; }
+  syncBody();
+  $("#w-restrict").onchange = (ev) => { restricted = ev.target.checked; syncBody(); };
+  $$(".week-day", mask).forEach((d) => {
+    d.onclick = () => {
+      const k = +d.dataset.d;
+      if (days.has(k)) { days.delete(k); d.classList.remove("on"); }
+      else { days.add(k); d.classList.add("on"); }
+    };
+  });
+
+  $("#w-save").onclick = async () => {
+    const box = $("#w-err");
+    box.classList.remove("show");
+    try {
+      const saved = await api(`/api/apps/${app.id}/environments/${env.id}/window`, {
+        method: "PUT",
+        body: {
+          deploy_restricted: restricted,
+          window_days: [...days].sort((a, b) => a - b),
+          window_start: $("#w-start").value || "10:00",
+          window_end: $("#w-end").value || "18:00",
+        },
+      });
+      toast("发布窗口已更新并留痕", "success");
+      env = saved; days = new Set(saved.window_days); restricted = saved.deploy_restricted;
+      start = saved.window_start; end = saved.window_end;
+      paintHolidays();
+      if (onSaved) onSaved();
+    } catch (e) { box.textContent = e.message; box.classList.add("show"); }
+  };
+
+  $("#h-add").onclick = async () => {
+    const box = $("#h-err");
+    box.classList.remove("show");
+    try {
+      await api(`/api/apps/${app.id}/environments/${env.id}/holidays`, {
+        method: "POST",
+        body: { date: $("#h-date").value, reason: $("#h-reason").value.trim() },
+      });
+      toast("已新增封网日并留痕", "success");
+      $("#h-date").value = ""; $("#h-reason").value = "";
+      paintHolidays();
+      if (onSaved) onSaved();
+    } catch (e) { box.textContent = e.message; box.classList.add("show"); }
+  };
+
+  async function paintHolidays() {
+    const fresh = await api(`/api/apps/${app.id}/environments/${env.id}/window`);
+    env.holidays = fresh.holidays;
+    const list = $("#h-list");
+    if (!fresh.holidays.length) { list.innerHTML = '<div class="empty-tip" style="padding:10px 0">暂无封网日</div>'; return; }
+    list.innerHTML = fresh.holidays.map((h) => `
+      <div class="holiday-row ${h.passed ? "passed" : ""}">
+        <span class="h-date">${esc(h.date)}</span>
+        <span class="h-reason">${esc(h.reason || "节假日封网")}</span>
+        ${h.passed ? '<span style="color:var(--ink-3);font-size:11px">（已过）</span>' : ""}
+        <button class="btn small" data-rmh="${h.id}">解除</button>
+      </div>`).join("");
+    $$("[data-rmh]", list).forEach((b) => {
+      b.onclick = async () => {
+        try {
+          await api(`/api/apps/${app.id}/environments/${env.id}/holidays/${b.dataset.rmh}`, { method: "DELETE" });
+          toast("已解除封网并留痕", "success"); paintHolidays();
+          if (onSaved) onSaved();
+        } catch (e) { toast(e.message, "error"); }
+      };
+    });
+  }
+  paintHolidays();
+}
+
+/* ---------------- 应用健康（跨应用作战台 / 单应用环境） ---------------- */
+async function renderHealthBoard() {
+  const view = $("#view");
+  view.innerHTML = `
+    <div class="page-head">
+      <div>
+        <h2>应用健康</h2>
+        <div class="sub">各应用各环境的实例存活与重启频率；掉线与频繁重启直接分级标出</div>
+      </div>
+    </div>
+    <div class="health-summary">
+      <button class="health-pill active" data-level="">全部异常</button>
+      <button class="health-pill" data-level="offline">实例掉线</button>
+      <button class="health-pill" data-level="critical">频繁重启</button>
+      <button class="health-pill" data-level="warning">重启偏多</button>
+      <button class="health-pill" data-level="normal">健康</button>
+    </div>
+    <select id="hb-bl" ${state.user.role === "admin" ? "" : "disabled"} style="margin-bottom:14px">
+      <option value="">全部业务线</option>
+      ${state.businessLines.map((b) => `<option value="${b.id}">${esc(b.name)}</option>`).join("")}
+    </select>
+    <div id="hb-result"><div class="empty-tip">加载中…</div></div>`;
+  let level = "";
+  const load = async () => {
+    const bl = $("#hb-bl").value;
+    const params = new URLSearchParams();
+    if (bl) params.set("business_line_id", bl);
+    let cards;
+    try {
+      cards = await api(`/api/health/overview?${params.toString()}`);
+    } catch (e) { $("#hb-result").innerHTML = errorStateHtml("加载失败", e.message); return; }
+    const shown = level ? cards.filter((c) => c.health.level === level)
+                        : cards.filter((c) => ["offline", "critical", "warning"].includes(c.health.level));
+    const box = $("#hb-result");
+    if (!shown.length) {
+      box.innerHTML = `<div class="panel panel-pad empty-tip">${level === "normal" ? "没有完全健康的环境" : "当前筛选下没有异常环境"}</div>`;
+      return;
+    }
+    box.innerHTML = `
+      <div class="panel table-wrap">
+        <table class="app-table">
+          <thead><tr><th>业务线</th><th>应用</th><th>环境</th><th>健康状态</th>
+            <th>实例(总/活/挂)</th><th>近24h重启</th><th>近7天异常实例</th><th>最近重启</th></tr></thead>
+          <tbody>
+            ${shown.map((c) => {
+              const h = c.health;
+              return `<tr data-app="${c.app_id}" data-env="${esc(c.environment)}">
+                <td>${esc(c.business_line_name)}</td>
+                <td class="app-name-cell">${esc(c.app_name)}
+                  ${c.app_status === "offline" ? '<span class="badge offline">已下线</span>' : ""}</td>
+                <td>${envTagHtml(c.environment, c.environment_label)}</td>
+                <td><span class="hl ${h.level}">${esc(h.level_label)}</span></td>
+                <td>${h.total} / ${h.alive} / <b class="${h.offline ? "r24-crit" : ""}">${h.offline}</b></td>
+                <td class="inst-restarts"><span class="${h.restarts_24h >= 5 ? "r24-crit" : h.restarts_24h >= 2 ? "r24-warn" : "r-normal"}">${h.restarts_24h} 次</span></td>
+                <td>${h.critical_count ? `<span class="r24-crit">频繁 ${h.critical_count}</span>` : ""}${h.warning_count ? ` <span class="r24-warn">偏多 ${h.warning_count}</span>` : ""}${!h.critical_count && !h.warning_count ? '<span class="r-normal">—</span>' : ""}</td>
+                <td>${h.last_restart_at ? fmtAgo(h.last_restart_at) : "—"}</td>
+              </tr>`;
+            }).join("")}
+          </tbody>
+        </table>
+      </div>
+      <p style="color:var(--ink-3);font-size:12px;margin:8px 2px">
+        分级：近 24 小时重启 ≥5 次为「频繁重启」（红），≥2 次或近 7 天 ≥7 次为「重启偏多」（黄）；半个月一次的正常重启不在此列。
+      </p>`;
+    $$("#hb-result [data-app]", box).forEach((tr) => {
+      tr.onclick = () => { location.hash = `#/health/${tr.dataset.app}/${tr.dataset.env}`; };
+    });
+  };
+  $$(".health-pill", view).forEach((p) => {
+    p.onclick = () => {
+      $$(".health-pill", view).forEach((x) => x.classList.toggle("active", x === p));
+      level = p.dataset.level; load();
+    };
+  });
+  $("#hb-bl").onchange = load;
+  await load();
+}
+
+async function renderAppHealth(appId, envKey) {
+  const view = $("#view");
+  view.innerHTML = `<div class="empty-tip">加载中…</div>`;
+  let app, health;
+  try {
+    [app, health] = await Promise.all([
+      api(`/api/apps/${appId}`),
+      api(`/api/apps/${appId}/health`),
+    ]);
+  } catch (e) {
+    view.innerHTML = errorStateHtml(e.status === 403 ? "403 无权访问" : "加载失败", e.message);
+    return;
+  }
+  const envs = health.environments;
+  let curKey = envKey && envs.some((e) => e.environment === envKey)
+    ? envKey : (envs[0] ? envs[0].environment : "");
+  const canManage = !!app.can_manage && app.status !== "offline";
+
+  const paint = () => {
+    const cur = envs.find((e) => e.environment === curKey) || envs[0];
+    const h = cur ? cur.health : { total: 0, alive: 0, offline: 0, instances: [], level: "empty", level_label: "未登记实例", restarts_24h: 0 };
+    const w = cur ? cur.window_status : null;
+    view.innerHTML = `
+      <div class="page-head">
+        <div>
+          <h2>${esc(app.name)} · 应用健康</h2>
+          <div class="sub">${esc(app.business_line_name)} · 实例级存活 / 掉线 / 重启监控</div>
+        </div>
+        <div style="display:flex;gap:8px">
+          <button class="btn" id="ah-board">← 健康总览</button>
+          ${canManage ? '<button class="btn" id="ah-env">环境与发布窗口</button>' : ""}
+          <button class="btn" id="ah-app">查看应用</button>
+        </div>
+      </div>
+      <div class="env-tabs">
+        ${envs.map((e) => {
+          const lv = e.health.level;
+          return `<a class="env-tab ${e.environment === curKey ? "active" : ""} ${e.environment === "prod" ? "prod" : ""}"
+            href="#/health/${appId}/${esc(e.environment)}">${esc(e.env_label)}
+            ${lv === "offline" ? ' 🔴' : lv === "critical" ? ' ⚠️' : ""}</a>`;
+        }).join("")}
+      </div>
+
+      ${cur ? (w && w.restricted && !w.allowed ? `
+        <div class="window-bar closed">
+          <span>🚫 ${esc(w.message)}</span>
+          ${canManage ? `<span class="wb-actions"><button class="btn small" id="ah-window">调整窗口</button></span>` : ""}
+        </div>` : `
+        <div class="window-bar ${w && w.allowed ? "open" : "closed"}">
+          <span>${w && w.allowed ? "🟢 发布窗口开放中" : "🕒"} ${esc(w ? w.window_text : "")}</span>
+          ${w && w.next_close_at ? `<span class="wb-detail">今天 ${fmtClock(w.next_close_at)} 关闭</span>` : ""}
+          ${canManage ? `<span class="wb-actions"><button class="btn small" id="ah-window">设置窗口 / 封网</button></span>` : ""}
+        </div>`) : ""}
+
+      <div class="panel panel-pad" style="margin-bottom:14px">
+        <div class="cfg-toolbar">
+          <h3 style="margin:0">${esc(cur ? cur.env_label : "")}环境实例
+            <span class="hl ${h.level}" style="margin-left:8px">${esc(h.level_label)}</span>
+          </h3>
+          <div style="display:flex;gap:14px;align-items:center;font-size:13px;color:var(--ink-2)">
+            <span>共 <b>${h.total}</b></span>
+            <span>存活 <b style="color:var(--green)">${h.alive}</b></span>
+            <span>掉线 <b style="color:${h.offline ? "var(--red)" : "inherit"}">${h.offline}</b></span>
+            <span>近24h重启 <b class="${h.restarts_24h >= 5 ? "r24-crit" : h.restarts_24h >= 2 ? "r24-warn" : ""}">${h.restarts_24h}</b></span>
+            ${canManage && cur ? `<button class="btn primary small" id="ah-add-inst">+ 登记实例</button>` : ""}
+          </div>
+        </div>
+        ${paintInstanceTable(app, cur, h.instances || [], canManage)}
+      </div>`;
+
+    $("#ah-board").onclick = () => { location.hash = "#/health"; };
+    $("#ah-app").onclick = () => { location.hash = `#/apps/${appId}`; };
+    const winBtn = $("#ah-window");
+    if (winBtn) winBtn.onclick = () => openWindowModalFromHealth(app, cur, reloadHealth);
+    const envBtn = $("#ah-env");
+    if (envBtn) envBtn.onclick = () => openEnvManagerModal(app);
+    const addBtn = $("#ah-add-inst");
+    if (addBtn) addBtn.onclick = () => openAddInstanceModal(app, cur, () => reloadHealth());
+    bindInstanceActions(app, cur, canManage, () => reloadHealth());
+  };
+
+  async function reloadHealth() {
+    health = await api(`/api/apps/${appId}/health`);
+    envs.length = 0;
+    health.environments.forEach((e) => envs.push(e));
+    paint();
+  }
+  paint();
+}
+
+function fmtClock(ts) {
+  const d = new Date(ts * 1000);
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+function paintInstanceTable(app, env, instances, canManage) {
+  if (!env) return `<div class="empty-tip">没有可见环境</div>`;
+  if (!instances.length) {
+    return `<div class="empty-tip">该环境还没有登记实例。${canManage ? "点右上角「登记实例」开始纳管。" : ""}</div>`;
+  }
+  return `
+    <div class="table-wrap">
+      <table class="app-table inst-table">
+        <thead><tr><th>实例</th><th>状态</th><th>累计重启</th><th>近24h</th><th>近7天</th>
+          <th>最后重启</th><th>最近存活</th><th>事件</th><th style="width:150px">操作</th></tr></thead>
+        <tbody>
+          ${instances.map((i) => {
+            const rc = i.restarts_24h >= 5 ? "r24-crit" : i.restarts_24h >= 2 ? "r24-warn" : "r-normal";
+            const r7c = i.restarts_7d >= 7 ? "r24-warn" : "r-normal";
+            return `<tr class="${i.status === "offline" ? "" : ""}">
+              <td class="mono app-name-cell">${esc(i.name)}</td>
+              <td><span class="inst-status"><span class="dot ${i.status}"></span>${esc(i.status_label)}</span>
+                ${i.status === "offline" && i.offline_since ? `<div class="app-desc">掉线 ${fmtAgo(i.offline_since)}</div>` : ""}</td>
+              <td>${i.restart_count} 次</td>
+              <td class="inst-restarts"><span class="${rc}">${i.restarts_24h}</span></td>
+              <td class="inst-restarts"><span class="${r7c}">${i.restarts_7d}</span></td>
+              <td>${i.last_restart_at ? fmtAgo(i.last_restart_at) : '<span class="r-normal">从未</span>'}</td>
+              <td>${fmtAgo(i.last_seen_at)}</td>
+              <td><button class="btn small" data-events="${i.id}">事件流</button></td>
+              <td>${canManage ? (i.status === "offline"
+                  ? `<button class="btn small" data-act="recover" data-id="${i.id}">恢复</button>`
+                  : `<button class="btn small" data-act="restart" data-id="${i.id}">重启</button>
+                     <button class="btn small danger" data-act="offline" data-id="${i.id}">模拟掉线</button>`)
+                : '<span class="r-normal">—</span>'}</td>
+            </tr>`;
+          }).join("")}
+        </tbody>
+      </table>
+    </div>
+    <p style="color:var(--ink-3);font-size:12px;margin:10px 2px 0">
+      近 24h 重启数 <b class="r24-crit">≥5</b> 标红（频繁重启），<b class="r24-warn">≥2</b> 或近 7 天 <b class="r24-warn">≥7</b> 标黄；
+      重启/掉线/恢复都会写入事件流与变更留痕。
+    </p>`;
+}
+
+function bindInstanceActions(app, env, canManage, onChange) {
+  if (!env) return;
+  $$("[data-events]").forEach((b) => {
+    b.onclick = () => openEventModal(app, +b.dataset.events);
+  });
+  if (!canManage) return;
+  $$("[data-act]").forEach((b) => {
+    b.onclick = async () => {
+      const act = b.dataset.act, id = b.dataset.id;
+      if (act === "offline" && !confirm("确认将该实例标记为掉线？会写入掉线事件与留痕，并在作战台冒出告警。")) return;
+      try {
+        await api(`/api/apps/${app.id}/instances/${id}/${act === "recover" ? "recover" : act}`, {
+          method: "POST", body: { detail: "" },
+        });
+        toast({ restart: "已记录一次重启", offline: "实例已标记掉线", recover: "实例已恢复存活" }[act], "success");
+        onChange();
+      } catch (e) { toast(e.message, "error"); }
+    };
+  });
+}
+
+async function openEventModal(app, instanceId) {
+  let events;
+  try {
+    events = await api(`/api/apps/${app.id}/instances/${instanceId}/events`);
+  } catch (e) { toast(e.message, "error"); return; }
+  const root = $("#modal-root");
+  root.insertAdjacentHTML("beforeend", `
+    <div class="modal-mask" id="ev-mask"><div class="modal" style="width:560px">
+      <h3>实例事件流</h3>
+      <div class="event-list">
+        ${events.length ? events.map((e) => `
+          <div class="event-row ${e.event_type}">
+            <span class="ev-time">${fmtTime(e.created_at)}</span>
+            <span class="ev-type">${esc(e.event_label)}</span>
+            <span>${esc(e.detail || "")}</span>
+            <span class="ai-meta" style="margin-left:auto">${esc(e.actor_name)}</span>
+          </div>`).join("") : '<div class="empty-tip">暂无事件</div>'}
+      </div>
+      <div class="form-actions"><button class="btn primary" id="ev-done">关闭</button></div>
+    </div></div>`);
+  $("#ev-done").onclick = () => $("#ev-mask").remove();
+  $("#ev-mask").onclick = (ev) => { if (ev.target.id === "ev-mask") $("#ev-mask").remove(); };
+}
+
+function openAddInstanceModal(app, env, onChange) {
+  const root = $("#modal-root");
+  root.insertAdjacentHTML("beforeend", `
+    <div class="modal-mask" id="ai-mask"><div class="modal" style="width:460px">
+      <h3>登记实例 · ${esc(env.env_label)}环境</h3>
+      <div class="form-grid" style="grid-template-columns:1fr">
+        <div><label>实例名 *</label>
+          <input id="ai-name" placeholder="如 pay-gw-7d9c4-pod-xxxx（集群内唯一）"></div>
+      </div>
+      <div class="form-error" id="ai-err"></div>
+      <div class="form-actions">
+        <button class="btn" id="ai-cancel">取消</button>
+        <button class="btn primary" id="ai-ok">登记（初始存活）</button>
+      </div>
+    </div></div>`);
+  const mask = $("#ai-mask");
+  $("#ai-cancel").onclick = () => mask.remove();
+  mask.onclick = (ev) => { if (ev.target === mask) mask.remove(); };
+  $("#ai-ok").onclick = async () => {
+    const box = $("#ai-err");
+    box.classList.remove("show");
+    try {
+      await api(`/api/apps/${app.id}/instances`, {
+        method: "POST", body: { environment: env.environment, name: $("#ai-name").value.trim() },
+      });
+      toast("实例已登记（初始存活）", "success");
+      mask.remove(); onChange();
+    } catch (e) { box.textContent = e.message; box.classList.add("show"); }
+  };
+}
+
+async function openWindowModalFromHealth(app, env, onChange) {
+  // 健康页只拿到 window/health，窗口编辑需要 environments 详情（usage/holidays/can_delete）
+  const envs = await api(`/api/apps/${app.id}/environments`);
+  const full = envs.find((x) => x.env_key === env.environment);
+  openWindowModal(app, full, onChange);
 }
 
 /* ---------------- 错误态 ---------------- */

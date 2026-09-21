@@ -26,6 +26,13 @@ PERM_COLS = {
 }
 
 
+def env_label_of(env: str | None) -> str:
+    """环境展示名：内置四环境走全局字典，应用自定义环境回退为键本身（各接口可再按应用覆盖）。"""
+    if not env:
+        return ""
+    return ENV_LABELS.get(env, env)
+
+
 # ---------------------------------------------------------------- 主体资料装载
 
 def build_principal(row: dict) -> dict:
@@ -80,15 +87,30 @@ def _grant_match(grants: list[dict], bl_id: int, env: str | None, perm: str):
 
 
 def _granted_envs(grants: list[dict], bl_id: int, perm: str = "view") -> list[str]:
-    """该用户在某业务线上被授予某项权限的环境集合（已展开 '*'）。"""
+    """该用户在某业务线上被授予某项权限的环境集合（已展开 '*'）。
+
+    '*' 授权语义上覆盖该业务线全部环境（含应用自定义环境）；这里只返回已知的
+    内置环境键用于拒绝原因展示，自定义键在具体应用上下文里由注册表判定。
+    """
     col = PERM_COLS[perm]
     envs: set[str] = set()
+    wildcard = False
     for g in grants:
         if g["business_line_id"] == bl_id and g[col]:
             if g["environment"] == ENV_SCOPE_ALL:
-                return list(ENV_LABELS.keys())
+                wildcard = True
             envs.add(g["environment"])
-    return [e for e in ENV_LABELS if e in envs]
+    if wildcard:
+        # 内置四环境 + 该业务线上出现过的自定义环境键（授权留痕/注册表可能引用）
+        rows = query(
+            """SELECT DISTINCT e.env_key FROM app_environments e
+               JOIN applications a ON a.id=e.app_id
+               WHERE a.business_line_id=?""",
+            (bl_id,),
+        )
+        envs.update(r["env_key"] for r in rows)
+    order = {k: i for i, k in enumerate(ENV_LABELS)}
+    return sorted(envs, key=lambda k: (order.get(k, 99), k))
 
 
 def visible_business_lines(user: dict) -> set[int]:
@@ -141,6 +163,22 @@ def _bl_name(bl_id: int) -> str:
     return row["name"] if row else f"#{bl_id}"
 
 
+def env_label_in_bl(bl_id: int, env: str | None) -> str:
+    """某业务线语境下的环境展示名：内置走全局字典，自定义环境取注册表里的名字。"""
+    if not env:
+        return ""
+    label = ENV_LABELS.get(env)
+    if label:
+        return label
+    row = query_one(
+        """SELECT e.env_label FROM app_environments e
+           JOIN applications a ON a.id=e.app_id
+           WHERE a.business_line_id=? AND e.env_key=? LIMIT 1""",
+        (bl_id, env),
+    )
+    return row["env_label"] if row else env
+
+
 def deny_reason(user: dict, bl_id: int, env: str | None, perm: str,
                 owns_app: bool = False) -> str:
     """生成越权说明：业务线级 / 环境级 / 权限级 三层原因。
@@ -164,22 +202,23 @@ def deny_reason(user: dict, bl_id: int, env: str | None, perm: str,
     # 2) 业务线在范围内，但目标环境没授权（拥有本次访问的具体应用时除外——那种情况下不会被拦到这里）
     view_envs = _granted_envs(grants, bl_id, "view")
     if env is not None and not is_bl_owner(user, bl_id) and not owns_app and env not in view_envs:
-        env_txt = "、".join(ENV_LABELS[e] for e in view_envs) if view_envs else "无"
+        env_txt = "、".join(env_label_in_bl(bl_id, e) for e in view_envs) if view_envs else "无"
         return (f"越权访问：你在业务线「{bl_name}」只有【{env_txt}】环境的访问权，"
-                f"【{ENV_LABELS[env]}】环境不在授权范围内。")
+                f"【{env_label_in_bl(bl_id, env)}】环境不在授权范围内。")
 
     # 3) 环境能看，但缺具体权限
+    env_name = env_label_in_bl(bl_id, env) if env else ""
     if perm == "edit":
         if user["role"] == "viewer":
             return (f"禁止修改：你的账号是「只读观察者」，对「{bl_name}"
-                    + (f"·{ENV_LABELS[env]}" if env else "")
+                    + (f"·{env_name}" if env else "")
                     + "」只有查看权，没有配置编辑权。")
         return (f"禁止修改：你的账号在「{bl_name}"
-                f"·{ENV_LABELS[env] if env else '全部环境'}」只有查看权（密文脱敏展示），"
+                f"·{env_name if env else '全部环境'}」只有查看权（密文脱敏展示），"
                 f"没有配置编辑权；能查看不等于能修改。请联系业务线负责人或平台管理员授予编辑权。")
     if perm == "reveal":
         return (f"禁止查看明文：你的账号在「{bl_name}"
-                f"·{ENV_LABELS[env] if env else '全部环境'}」没有密文查看权。"
+                f"·{env_name if env else '全部环境'}」没有密文查看权。"
                 f"密文查看权与配置查看/编辑权分开授予，能看脱敏值或能改配置都不代表能看明文，"
                 f"请向业务线负责人或平台管理员单独申请密文查看权。")
     return f"越权访问：你没有「{bl_name}」的访问权限。"

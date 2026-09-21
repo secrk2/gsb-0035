@@ -551,7 +551,7 @@ def audit_row_to_dict(r) -> dict:
         "app_name": r["app_name"],
         "business_line_name": r["business_line_name"],
         "environment": r["environment"],
-        "environment_label": ENV_LABELS[r["environment"]],
+        "environment_label": ENV_LABELS.get(r["environment"], r["environment"]),
         "action": r["action"],
         "action_label": ACTION_LABELS.get(r["action"], r["action"]),
         "config_key": r["config_key"],

@@ -364,6 +364,7 @@ button { font-family: inherit; }
   .dash-grid { grid-template-columns: 1fr; }
   .detail-grid, .cfg-grid { grid-template-columns: 1fr; }
   .red-groups { grid-template-columns: 1fr; }
+  #ha-grid { grid-template-columns: 1fr !important; }
 }
 
 /* ---------- 响应式：手机（表格 -> 卡片，卡片内两列排布） ---------- */
@@ -456,3 +457,114 @@ button { font-family: inherit; }
 .action-tag.transfer    { background: #eafaf1; color: #0f8a4c; }
 .action-tag.revoke      { background: #fde8e8; color: #c02f33; }
 .action-tag.grant       { background: #e5f8ee; color: #0f8a4c; }
+
+/* ==================== 环境管理 / 发布窗口 / 应用健康（本轮新增） ==================== */
+
+/* 健康分级徽标 */
+.hl {
+  display: inline-flex; align-items: center; gap: 5px;
+  font-size: 12px; font-weight: 600; border-radius: 999px; padding: 2px 10px; white-space: nowrap;
+}
+.hl::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+.hl.offline  { background: #fde8e8; color: #c02f33; }
+.hl.critical { background: #fde8e8; color: #c02f33; }
+.hl.critical::before { animation: blink 1s infinite; }
+@keyframes blink { 50% { opacity: .2; } }
+.hl.warning  { background: #fdf3d7; color: #ad7209; }
+.hl.normal   { background: #e5f8ee; color: #0f8a4c; }
+.hl.empty    { background: #eceff3; color: #8a94a6; }
+
+/* 实例状态点 */
+.inst-status { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; }
+.dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+.dot.alive { background: var(--green); }
+.dot.offline { background: var(--red); box-shadow: 0 0 0 3px rgba(229,72,77,.18); }
+
+/* 发布窗口状态条 */
+.window-bar {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  border-radius: 8px; padding: 9px 13px; margin-bottom: 12px; font-size: 13px;
+  border: 1px solid var(--line); background: #f7f9fc;
+}
+.window-bar.open { background: #eefaf3; border-color: #b6e6cc; color: #0c6f3e; }
+.window-bar.closed { background: #fdf0f0; border-color: #f3c1c2; color: #a02a2e; }
+.window-bar .wb-next { font-weight: 700; }
+.window-bar .wb-detail { color: var(--ink-2); font-size: 12.5px; }
+.window-bar .wb-actions { margin-left: auto; display: flex; gap: 8px; }
+
+/* 环境卡片网格 */
+.env-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(330px, 1fr)); gap: 14px; }
+.env-card { padding: 14px 16px; display: flex; flex-direction: column; gap: 9px; }
+.env-card .ec-head { display: flex; align-items: center; gap: 8px; }
+.env-card .ec-name { font-size: 15px; font-weight: 700; }
+.env-card .ec-tag { font-size: 11px; color: var(--ink-3); border: 1px solid var(--line); border-radius: 6px; padding: 0 6px; }
+.env-card .ec-primary { font-size: 11px; color: var(--brand); background: #e8f0ff; border-radius: 6px; padding: 0 6px; }
+.env-card .ec-window { font-size: 12.5px; color: var(--ink-2); }
+.env-card .ec-health { display: flex; align-items: center; gap: 8px; font-size: 12.5px; flex-wrap: wrap; }
+.env-card .ec-nums { color: var(--ink-3); font-size: 12px; }
+.env-card .ec-actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 2px; }
+.env-card.has-offline { border-color: #f3c1c2; box-shadow: 0 0 0 1px rgba(229,72,77,.12); }
+
+/* 周几选择 */
+.week-days { display: flex; gap: 6px; flex-wrap: wrap; }
+.week-day {
+  border: 1px solid var(--line); border-radius: 8px; padding: 6px 0; width: 52px; text-align: center;
+  cursor: pointer; font-size: 13px; background: #fff; color: var(--ink-2); user-select: none;
+}
+.week-day.on { background: var(--brand); border-color: var(--brand); color: #fff; font-weight: 600; }
+.time-range { display: flex; align-items: center; gap: 8px; }
+.time-range input { width: 90px; }
+
+/* 节假日封网列表 */
+.holiday-list { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
+.holiday-row {
+  display: flex; align-items: center; gap: 10px; font-size: 12.5px;
+  background: #f7f9fc; border: 1px solid var(--line); border-radius: 8px; padding: 6px 10px;
+}
+.holiday-row.passed { opacity: .55; }
+.holiday-row .h-date { font-weight: 600; }
+.holiday-row .h-reason { color: var(--ink-2); }
+.holiday-row button { margin-left: auto; }
+
+/* 作战台健康告警面板 */
+.alert-panel { border-left: 4px solid var(--red); }
+.alert-item {
+  display: flex; align-items: center; gap: 10px; padding: 9px 2px;
+  border-bottom: 1px solid var(--line); cursor: pointer; flex-wrap: wrap;
+}
+.alert-item:last-child { border-bottom: none; }
+.alert-item:hover { background: #f6f9ff; }
+.alert-item .ai-target { font-weight: 600; }
+.alert-item .ai-meta { color: var(--ink-3); font-size: 12px; }
+.alert-item .ai-time { margin-left: auto; color: var(--ink-3); font-size: 12px; white-space: nowrap; }
+.restart-badge-crit { color: #c02f33; font-weight: 700; }
+.restart-badge-warn { color: #ad7209; font-weight: 700; }
+
+/* 应用健康页 */
+.health-summary { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 14px; }
+.health-pill {
+  border: 1px solid var(--line); border-radius: 999px; padding: 6px 16px; font-size: 13px;
+  background: #fff; cursor: pointer; color: var(--ink-2);
+}
+.health-pill.active { border-color: var(--brand); color: var(--brand); font-weight: 600; background: #f5f8ff; }
+.health-pill .n { font-weight: 700; margin-left: 4px; }
+.inst-table td .inst-restarts { font-variant-numeric: tabular-nums; }
+.r24-crit { color: #c02f33; font-weight: 700; }
+.r24-warn { color: #ad7209; font-weight: 600; }
+.r-normal { color: var(--ink-3); }
+
+/* 事件流 */
+.event-list { font-size: 12.5px; max-height: 260px; overflow-y: auto; }
+.event-row { display: flex; gap: 10px; padding: 6px 0; border-bottom: 1px solid var(--line); }
+.event-row:last-child { border-bottom: none; }
+.event-row .ev-time { color: var(--ink-3); white-space: nowrap; }
+.event-row.restart .ev-type { color: #ad7209; }
+.event-row.offline .ev-type { color: #c02f33; font-weight: 700; }
+.event-row.recover .ev-type { color: #0f8a4c; font-weight: 700; }
+
+/* 留痕页类别标签 */
+.action-tag.env_create, .action-tag.instance_recover { background: #e5f8ee; color: #0f8a4c; }
+.action-tag.env_delete, .action-tag.instance_offline, .action-tag.deploy_block { background: #fde8e8; color: #c02f33; }
+.action-tag.window_update, .action-tag.holiday_add, .action-tag.holiday_remove { background: #e8f0ff; color: #2f6bff; }
+.action-tag.instance_restart { background: #fdf3d7; color: #ad7209; }
+.action-tag.instance_register, .action-tag.instance_remove { background: #eceff3; color: #6b7686; }
